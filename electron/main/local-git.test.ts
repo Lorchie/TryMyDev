@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, existsSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { after, afterEach, before, describe, it } from 'node:test'
@@ -80,7 +80,8 @@ describe('resolveLocal', () => {
   it('finds the top level from a subfolder, and follows the folder without a branch', async () => {
     const dir = await clone()
     const resolved = await resolveLocal(local(join(dir, 'sub')))
-    assert.equal(relative(resolved.source.path, dir), '')
+    // git gives the real path: temporary folders reach it through a link (macOS) or a short name (Windows).
+    assert.equal(relative(resolved.source.path, realpathSync.native(dir)), '')
     assert.equal(resolved.source.ref, undefined)
     assert.equal(resolved.upstream, undefined, 'no remote: an application of its own')
     assert.equal(resolved.name, `my project ${count}`)
