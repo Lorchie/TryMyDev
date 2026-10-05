@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { BranchLog } from '../logger'
 import { cleanup, useUserData } from '../testing'
-import { ensurePython, ensureUv } from './python'
+import { cachedUv, ensurePython, ensureUv, uvLayout } from './python'
 
 const network = process.env.TRYMYDEV_NETWORK_TESTS === '1'
 let data: string
@@ -12,6 +13,19 @@ before(() => {
   data = useUserData()
 })
 after(() => cleanup(data))
+
+describe('cachedUv', () => {
+  it('finds uv in the store, and nothing before it is there', async () => {
+    assert.equal(await cachedUv(), undefined)
+    const { dir, name } = uvLayout()
+    const bin = join(dir, 'uv-x86_64-pc-windows-msvc', name)
+    mkdirSync(dirname(bin), { recursive: true })
+    writeFileSync(bin, '')
+    assert.equal(await cachedUv(), bin)
+    // The network test below needs the real one.
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
 
 describe('ensurePython', { skip: network ? false : 'downloads uv and Python: set TRYMYDEV_NETWORK_TESTS=1' }, () => {
   it('installs the latest release of a minor line through uv, then finds it offline', async () => {

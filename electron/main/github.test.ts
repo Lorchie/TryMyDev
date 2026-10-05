@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, afterEach, before, describe, it } from 'node:test'
-import { downloadTarball, headSha, rateLimit, resolveSource } from './github'
+import { downloadArtifact, downloadTarball, headSha, rateLimit, resolveSource } from './github'
 import { setGithubToken } from './settings'
 import { cleanup, useUserData } from './testing'
 
@@ -33,7 +33,7 @@ afterEach(() => {
 after(() => cleanup(data))
 
 describe('headSha', () => {
-  const src = { owner: 'o', repo: 'r', ref: 'feat/x' }
+  const src = { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'feat/x' }
 
   it('asks for the sha of an encoded ref, anonymously, and remembers its etag', async () => {
     mockFetch(() => new Response(`${SHA}\n`, { status: 200, headers: { etag: '"v1"' } }))
@@ -90,17 +90,29 @@ describe('with a token in Settings', () => {
 
   it('authenticates every request', async () => {
     mockFetch(() => new Response(SHA))
-    await headSha({ owner: 'o', repo: 'private', ref: 'main' })
+    await headSha({ kind: 'github' as const, owner: 'o', repo: 'private', ref: 'main' })
     assert.equal(calls[0].headers.Authorization, 'Bearer github_pat_test')
 
     mockFetch(() => new Response(Buffer.alloc(8)))
-    await downloadTarball({ owner: 'o', repo: 'private', ref: 'main' }, SHA, join(data, 'p.tar.gz'), () => undefined)
+    await downloadTarball({ kind: 'github' as const, owner: 'o', repo: 'private', ref: 'main' }, SHA, join(data, 'p.tar.gz'), () => undefined)
+    assert.equal(calls[0].headers.Authorization, 'Bearer github_pat_test')
+  })
+
+  it('sends it with an artifact address only when that address is GitHub\'s API', async () => {
+    mockFetch(() => new Response(Buffer.alloc(8)))
+    const artifact = { repo: 'o/r', id: 7, size: 8 }
+    await assert.rejects(
+      downloadArtifact({ ...artifact, url: 'https://x.example/artifacts/7/zip' }, join(data, 'a.zip'), () => undefined),
+      /outside GitHub's API/
+    )
+    assert.equal(calls.length, 0)
+    await downloadArtifact({ ...artifact, url: 'https://api.github.com/repos/o/r/actions/artifacts/7/zip' }, join(data, 'a.zip'), () => undefined)
     assert.equal(calls[0].headers.Authorization, 'Bearer github_pat_test')
   })
 
   it('explains a token GitHub no longer accepts', async () => {
     mockFetch(() => new Response('{}', { status: 401, statusText: 'Unauthorized' }))
-    await assert.rejects(headSha({ owner: 'o', repo: 'private', ref: 'x' }), /rejected the token saved in Settings/)
+    await assert.rejects(headSha({ kind: 'github' as const, owner: 'o', repo: 'private', ref: 'x' }), /rejected the token saved in Settings/)
   })
 })
 
@@ -122,16 +134,16 @@ describe('resolveSource', () => {
     mockFetch(() =>
       json({ full_name: 'someone/modly', default_branch: 'main', source: { full_name: 'lightningpixel/modly' } })
     )
-    assert.deepEqual(await resolveSource({ owner: 'someone', repo: 'modly' }), {
-      source: { owner: 'someone', repo: 'modly', ref: 'main' },
+    assert.deepEqual(await resolveSource({ kind: 'github' as const, owner: 'someone', repo: 'modly' }), {
+      source: { kind: 'github' as const, owner: 'someone', repo: 'modly', ref: 'main' },
       upstream: 'lightningpixel/modly'
     })
   })
 
   it('keeps the ref it was given, and follows a repository that moved', async () => {
     mockFetch(() => json({ full_name: 'Comfy-Org/ComfyUI', default_branch: 'master' }))
-    assert.deepEqual(await resolveSource({ owner: 'comfyanonymous', repo: 'ComfyUI', ref: 'dev' }), {
-      source: { owner: 'comfyanonymous', repo: 'ComfyUI', ref: 'dev' },
+    assert.deepEqual(await resolveSource({ kind: 'github' as const, owner: 'comfyanonymous', repo: 'ComfyUI', ref: 'dev' }), {
+      source: { kind: 'github' as const, owner: 'comfyanonymous', repo: 'ComfyUI', ref: 'dev' },
       upstream: 'Comfy-Org/ComfyUI'
     })
   })
@@ -143,8 +155,8 @@ describe('resolveSource', () => {
         base: { repo: { full_name: 'lightningpixel/modly' } }
       })
     )
-    assert.deepEqual(await resolveSource({ owner: 'lightningpixel', repo: 'modly', pr: 7 }), {
-      source: { owner: 'someone', repo: 'modly', ref: 'fix', pr: 7 },
+    assert.deepEqual(await resolveSource({ kind: 'github' as const, owner: 'lightningpixel', repo: 'modly', pr: 7 }), {
+      source: { kind: 'github' as const, owner: 'someone', repo: 'modly', ref: 'fix', pr: 7 },
       upstream: 'lightningpixel/modly'
     })
     assert.match(calls[0].url, /\/repos\/lightningpixel\/modly\/pulls\/7$/)
@@ -152,12 +164,12 @@ describe('resolveSource', () => {
 
   it('explains a pull request whose fork is gone', async () => {
     mockFetch(() => json({ head: { ref: 'fix', repo: null } }))
-    await assert.rejects(resolveSource({ owner: 'o', repo: 'r', pr: 9 }), /fork deleted/)
+    await assert.rejects(resolveSource({ kind: 'github' as const, owner: 'o', repo: 'r', pr: 9 }), /fork deleted/)
   })
 
   it('refuses a repository without a default branch', async () => {
     mockFetch(() => json({ full_name: 'o/empty' }))
-    await assert.rejects(resolveSource({ owner: 'o', repo: 'empty' }), /No default branch found for o\/empty/)
+    await assert.rejects(resolveSource({ kind: 'github' as const, owner: 'o', repo: 'empty' }), /No default branch found for o\/empty/)
   })
 })
 
@@ -168,7 +180,7 @@ describe('downloadTarball', () => {
     const target = join(data, 'sources.tar.gz')
     const seen: number[] = []
 
-    await downloadTarball({ owner: 'o', repo: 'r', ref: 'main' }, SHA, target, (received, total) => {
+    await downloadTarball({ kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }, SHA, target, (received, total) => {
       assert.equal(total, body.length)
       seen.push(received)
     })
@@ -181,7 +193,7 @@ describe('downloadTarball', () => {
   it('fails on an error status', async () => {
     mockFetch(() => new Response('', { status: 404 }))
     await assert.rejects(
-      downloadTarball({ owner: 'o', repo: 'r', ref: 'main' }, SHA, join(data, 'x.tar.gz'), () => undefined),
+      downloadTarball({ kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }, SHA, join(data, 'x.tar.gz'), () => undefined),
       /Could not download the sources \(HTTP 404\)/
     )
   })

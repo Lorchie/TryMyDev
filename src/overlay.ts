@@ -140,7 +140,7 @@ byId('show').addEventListener('click', () => void window.overlay.report.show())
 // ── Menu ────────────────────────────────────────────────────────────────────────
 
 /** The tester's tools, in the order shown. */
-const TOOLS: Tool[] = [{ label: 'Report bug', hint: 'Screenshot, recent steps and errors', run: () => void startReport() }]
+const TOOLS: Tool[] = [{ label: 'Report a bug', hint: 'Adds a screenshot, your recent steps and the errors.', run: () => void startReport() }]
 
 for (const tool of TOOLS) {
   const button = document.createElement('button')

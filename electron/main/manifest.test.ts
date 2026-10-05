@@ -149,8 +149,8 @@ describe('approval of code from another repository', () => {
   it('warns when the code does not come from the application repository', () => {
     const m = parse(minimal)
     const app: App = { id: 'o-r', name: 'R', repo: 'Owner/R', addedAt: '' }
-    const own = approvalOf(app, m, { owner: 'owner', repo: 'r', ref: 'main' })
-    const stranger = approvalOf(app, m, { owner: 'stranger', repo: 'r', ref: 'evil' })
+    const own = approvalOf(app, m, { kind: 'github' as const, owner: 'owner', repo: 'r', ref: 'main' })
+    const stranger = approvalOf(app, m, { kind: 'github' as const, owner: 'stranger', repo: 'r', ref: 'evil' })
     assert.equal(own.foreign, false)
     assert.equal(stranger.foreign, true)
     assert.equal(stranger.repo, 'stranger/r')
@@ -219,7 +219,7 @@ describe('seed', () => {
 
   it('shows every seed, with its content, before approval', () => {
     const m = parse({ ...minimal, seed: [settings, { path: 'deps/venv', link: '{venv}' }] })
-    assert.deepEqual(approvalOf({ id: 'o-r', name: 'R', addedAt: '' }, m, { owner: 'o', repo: 'r', ref: 'main' }).settings, [
+    assert.deepEqual(approvalOf({ id: 'o-r', name: 'R', addedAt: '' }, m, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }).settings, [
       `file in the data folder, once: settings.json = ${JSON.stringify(settings.json)}`,
       'link in the data folder: deps/venv → {venv}'
     ])
@@ -270,7 +270,7 @@ describe('folders', () => {
 
   it('shows where each folder will be before approval, and that the tester can switch', () => {
     const m = parse({ ...minimal, folders: [extensions, { ...extensions, id: 'workflows', label: 'Workflows', own: '{shared}/workflows', use: 'own' }] })
-    assert.deepEqual(approvalOf({ id: 'o-r', name: 'R', addedAt: '' }, m, { owner: 'o', repo: 'r', ref: 'main' }).settings, [
+    assert.deepEqual(approvalOf({ id: 'o-r', name: 'R', addedAt: '' }, m, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }).settings, [
       "folder \"Extensions\": the installed application's (extensionsDir in {appData}/App/settings.json, else {documents}/App/extensions), else TryMyDev's {short}/ext — you can switch",
       "folder \"Workflows\": TryMyDev's {shared}/workflows, or the installed application's (extensionsDir in {appData}/App/settings.json, else {documents}/App/extensions) — you can switch"
     ])
@@ -313,7 +313,7 @@ describe('approvalOf', () => {
       isolate: [{ env: 'APP_HOME', dir: 'home' }],
       env: { MODE: 'test' }
     })
-    const approval = approvalOf(app, m, { owner: 'fork', repo: 'r', ref: 'main' })
+    const approval = approvalOf(app, m, { kind: 'github' as const, owner: 'fork', repo: 'r', ref: 'main' })
 
     assert.deepEqual(approval.commands, ['pip install -r requirements.txt    (in api)', 'npm run dev'])
     assert.deepEqual(approval.settings, [
@@ -325,6 +325,15 @@ describe('approvalOf', () => {
     assert.equal(approval.manifestHash, manifestHash(m))
     assert.equal(approval.downloads.length, 3)
     assert.match(approval.downloads.join('\n'), /Node\.js[\s\S]*Python[\s\S]*Sources of fork\/r/)
+  })
+
+  it('points at the commands the last approval of this code did not have, and only when there was one', () => {
+    const m = parse({ ...minimal, install: [{ run: 'npm ci' }], build: [{ run: 'npm run build' }] })
+    const src = { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }
+
+    assert.equal(approvalOf(app, m, src).changed, undefined)
+    assert.deepEqual(approvalOf(app, m, src, [], ['npm ci', 'npm run dev']).changed, [1])
+    assert.deepEqual(approvalOf(app, m, src, [], approvalOf(app, m, src).commands).changed, [])
   })
 
   it('describes an Electron start in words', () => {
@@ -346,7 +355,7 @@ describe('resolveManifest', () => {
     return dir
   }
   const app = (extra: Partial<App> = {}): App => ({ id: 'app', name: 'App', addedAt: '', ...extra })
-  const src = { owner: 'o', repo: 'r', ref: 'main' }
+  const src = { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }
   const pkg = JSON.stringify({ name: 'detected-app', scripts: { dev: 'vite' } })
 
   it('prefers the manifest committed in the repository', () => {
@@ -372,6 +381,7 @@ describe('resolveManifest', () => {
 
   it('then a built-in profile, found through the upstream even for a fork', () => {
     const m = resolveManifest(checkout({ 'package.json': pkg }), app({ repo: 'lightningpixel/modly' }), {
+      kind: 'github',
       owner: 'someone',
       repo: 'modly-fork',
       ref: 'fix'
@@ -382,7 +392,7 @@ describe('resolveManifest', () => {
 
   it('recognises ComfyUI in its current home', () => {
     const dir = checkout({ 'requirements.txt': 'torch', 'main.py': '' })
-    const m = resolveManifest(dir, app({ repo: 'Comfy-Org/ComfyUI' }), { owner: 'Comfy-Org', repo: 'ComfyUI', ref: 'master' })
+    const m = resolveManifest(dir, app({ repo: 'Comfy-Org/ComfyUI' }), { kind: 'github' as const, owner: 'Comfy-Org', repo: 'ComfyUI', ref: 'master' })
     assert.equal(m.source, 'builtin')
     assert.match(m.install?.[0]?.run ?? '', /download\.pytorch\.org/)
   })
@@ -391,5 +401,43 @@ describe('resolveManifest', () => {
     const m = resolveManifest(checkout({ 'package.json': pkg, 'package-lock.json': '{}' }), app(), src)
     assert.equal(m.source, 'detected')
     assert.equal(m.name, 'detected-app')
+  })
+})
+
+describe('mobile manifests', () => {
+  const github = { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }
+  const app: App = { id: 'o-r', name: 'R', repo: 'o/r', addedAt: '' }
+
+  it('accepts android and expo starts, and checks what they name', () => {
+    parse({ name: 'A', build: [{ run: 'gradlew assembleDebug' }], start: { mode: 'android', apk: 'app/build', package: 'com.example.app', artifact: 'apk' } })
+    parse({ name: 'E', start: { mode: 'expo', run: 'npx expo start --port {port}' } })
+    invalid({ name: 'A', start: { mode: 'android', apk: '../outside.apk' } }, /relative path inside the project/)
+    invalid({ name: 'A', start: { mode: 'android', package: 'no dots; rm' } }, /application id/)
+    invalid({ name: 'E', start: { mode: 'expo' } }, /"start.run" is required for mode expo/)
+    invalid({ name: 'X', start: { mode: 'ios' } }, /must be electron, web, command, android, expo/)
+  })
+
+  it('needs a JDK and the Android SDK for Gradle, and Flutter for flutter', () => {
+    const gradle = parse({ name: 'A', build: [{ run: './gradlew assembleDebug', cwd: 'android' }], start: { mode: 'android' } })
+    assert.deepEqual(['node', 'python', 'java', 'android', 'flutter'].map((k) => wants(gradle, k as never)), [false, false, true, true, false])
+    const flutter = parse({ name: 'F', build: [{ run: 'flutter build apk --debug' }], start: { mode: 'android' } })
+    assert.deepEqual(['java', 'android', 'flutter'].map((k) => wants(flutter, k as never)), [true, true, true])
+    const prebuilt = parse({ name: 'P', start: { mode: 'android', apk: 'app.apk' } })
+    assert.equal(wants(prebuilt, 'java'), false, 'an APK given as it is needs no JDK')
+    assert.equal(wants(parse({ name: 'J', runtime: { java: '21' }, start: { mode: 'command', run: 'java -jar x.jar' } }), 'java'), true)
+  })
+
+  it("lists the downloads, and says approving accepts the Android SDK licence", () => {
+    const m = parse({ name: 'A', build: [{ run: 'gradlew assembleDebug' }], start: { mode: 'android' } })
+    const approval = approvalOf(app, m, github)
+    assert.equal(approval.commands.at(-1), 'install the APK built on an Android phone or emulator and open it')
+    assert.ok(approval.downloads.some((d) => /Java runtime/.test(d)))
+    assert.ok(approval.downloads.some((d) => /Android emulator/.test(d)))
+    assert.ok(approval.downloads.some((d) => /accepts the Android Software Development Kit License Agreement for you: https:\/\/developer\.android\.com\/studio\/terms/.test(d)))
+    const expo = approvalOf(app, parse({ name: 'E', install: [{ run: 'npm install' }], start: { mode: 'expo', run: 'npx expo start' } }), github)
+    assert.ok(!expo.downloads.some((d) => /Licen[cs]e/i.test(d)))
+    assert.ok(expo.downloads.some((d) => /Expo Go on the phone/.test(d)))
+    assert.ok(expo.warnings.some((w) => /every device on this network/.test(w)))
+    assert.ok(!approval.warnings.some((w) => /every device on this network/.test(w)))
   })
 })

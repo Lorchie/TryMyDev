@@ -16,6 +16,14 @@ export const app = {
   }
 }
 
+/** The window's appearance: what the Appearance setting hands it. */
+export const nativeTheme = { themeSource: 'system', shouldUseDarkColors: true, on: () => nativeTheme }
+
+/** An image made from bytes, such as a device's screenshot. */
+export const nativeImage = {
+  createFromBuffer: () => fakeImage
+}
+
 /** A captured page: a few bytes standing for a PNG. */
 const fakeImage = {
   isEmpty: () => false,

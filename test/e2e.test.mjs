@@ -115,7 +115,7 @@ describe('TryMyDev window', () => {
   it('removes an application after confirmation, at once, and its folder soon after', async () => {
     assert.ok(await click('.app-item', 'Drop Me'))
     assert.ok(await click('header button', 'Remove'))
-    assert.equal(await until(() => evaluate(`document.querySelector('.dialog h2')?.textContent`)), 'Remove Drop Me')
+    assert.equal(await until(() => evaluate(`document.querySelector('.dialog h2')?.textContent`)), 'Remove Drop Me?')
     assert.ok(await click('.dialog button.primary', 'Remove'))
 
     await until(() => evaluate(`![...document.querySelectorAll('.app-item')].some((e) => e.textContent.includes('Drop Me'))`), 3_000)
@@ -141,7 +141,7 @@ describe('TryMyDev window', () => {
 
     assert.ok(await click('aside button', 'Settings'))
     assert.equal(await until(() => evaluate(`document.querySelector('.dialog h2')?.textContent`)), 'Settings')
-    await until(() => evaluate(`document.querySelector('.dialog')?.textContent.includes('No token saved.')`))
-    assert.ok(await click('.dialog button', 'Close'))
+    await until(() => evaluate(`document.querySelector('.dialog')?.textContent.includes('No token')`))
+    assert.ok(await click('.dialog button', 'Done'))
   })
 })

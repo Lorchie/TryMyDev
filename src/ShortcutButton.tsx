@@ -7,14 +7,14 @@ export function ShortcutButton({ branchKey }: { branchKey: string }): JSX.Elemen
   return (
     <button
       className="ghost"
-      title="Desktop shortcut that opens this branch directly"
+      title="Create a desktop shortcut that opens this branch directly"
       onClick={async () => {
         await window.trymydev.shortcut(branchKey)
         setCreated(true)
         setTimeout(() => setCreated(false), 2000)
       }}
     >
-      {created ? 'Shortcut created' : 'Shortcut'}
+      {created ? '✓ Shortcut on desktop' : 'Desktop shortcut'}
     </button>
   )
 }

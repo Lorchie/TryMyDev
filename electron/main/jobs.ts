@@ -6,12 +6,33 @@ import { BranchLog } from './logger'
 import { processImage, processStartTime } from './proc'
 import { ApprovalRequired, checkRemote, patchState, provision, readState } from './provision'
 import * as registry from './registry'
-import { adopt, isRunning, launch, stop } from './runner'
-import type { Branch, BranchState, JobError, JobEvent, JobStep } from './types'
+import { adopt, isRunning, launch, stop, untilStopped } from './runner'
+import { hasGithubToken } from './settings'
+import { PHASES, type Approval, type Branch, type BranchState, type JobError, type JobEvent, type JobStep } from './types'
 
 const jobs = new Map<string, AbortController>()
 /** Jobs still preparing — installing from the download caches — rather than running. */
 const preparing = new Set<string>()
+/** The approval each branch waits for: what the tester was shown, kept with what they approve. */
+const pending = new Map<string, Approval>()
+
+/** The phase of `PHASES` each step belongs to; `running` and `done` stay in the one before. */
+const PHASE_OF: Partial<Record<JobStep, number>> = {
+  resolve: 0,
+  download: 0,
+  manifest: 0,
+  runtime: 1,
+  install: 1,
+  build: 2,
+  launch: 3
+}
+
+/** The phase a failure happened in: an application that exits failed at its start. */
+export const phaseOf = (step: JobStep): number => PHASE_OF[step] ?? PHASES.length - 1
+
+export function pendingApproval(key: string): Approval | undefined {
+  return pending.get(key)
+}
 
 export function busy(key: string): boolean {
   return jobs.has(key)
@@ -40,6 +61,7 @@ export type StartOutcome =
  * unapproved manifest reaches them as the list of commands it wants to run.
  */
 export async function startBranch(win: BrowserWindow, key: string): Promise<StartOutcome> {
+  await untilStopped(key)
   if (isRunning(key)) return { status: 'running', url: readState(registry.getBranch(key).appId, key).url }
   if (jobs.has(key)) return { status: 'busy' }
 
@@ -47,17 +69,35 @@ export async function startBranch(win: BrowserWindow, key: string): Promise<Star
   const app = registry.getApp(branch.appId)
   const controller = new AbortController()
   jobs.set(key, controller)
+  pending.delete(key)
+  // The window shows the branch as preparing from now, not only once the job is over.
+  send(win, 'branch:updated', { key })
 
   const log = new BranchLog(app.id, key)
   log.line(`=== ${app.name} · ${registry.label(branch)} ===`)
   log.onLine((line) => send(win, 'job:log', { key, line }))
 
+  const startedAt = Date.now()
+  const estimate = readState(app.id, key).durations
+  const durations = PHASES.map(() => 0)
+  /** Only a start that fetched or built something says how long the next one may take. */
+  let worked = false
   let step: JobStep = 'resolve'
-  let since = Date.now()
+  let since = startedAt
+  let phase = 0
+  let phaseSince = startedAt
   const emit = (s: JobStep, message: string, percent?: number): void => {
-    if (s !== step) since = Date.now()
+    const now = Date.now()
+    if (s !== step) since = now
     step = s
-    send<JobEvent>(win, 'job:step', { key, step: s, message, percent, since })
+    if (s === 'download' || s === 'install' || s === 'build') worked = true
+    const next = PHASE_OF[s]
+    if (next !== undefined && next !== phase) {
+      durations[phase] += now - phaseSince
+      phase = next
+      phaseSince = now
+    }
+    send<JobEvent>(win, 'job:step', { key, step: s, message, percent, since, phase, phaseSince, startedAt, estimate })
   }
 
   try {
@@ -67,7 +107,7 @@ export async function startBranch(win: BrowserWindow, key: string): Promise<Star
     )
 
     emit('launch', `Starting ${manifest.name}…`)
-    const { url, detached } = await launch(app, branch, manifest, state, toolchain, log, controller.signal, (code) => {
+    const { url, detached, device } = await launch(app, branch, manifest, state, toolchain, log, controller.signal, (code, reason) => {
       jobs.delete(key)
       patchState(app.id, key, { running: undefined })
       send(win, 'branch:updated', { key })
@@ -80,15 +120,22 @@ export async function startBranch(win: BrowserWindow, key: string): Promise<Star
         fail(win, {
           key,
           step: 'running',
-          message: `${manifest.name} exited with code ${code}.`,
+          message: reason ? `${manifest.name} ${reason.replace(/^The application /, '')}.` : `${manifest.name} exited with code ${code}.`,
           logTail,
           logPath: log.path
         })
       )
-    })
+    }, (message) => emit('launch', message))
 
-    patchState(app.id, key, { url, lastLaunch: new Date().toISOString(), running: detached })
-    emit('running', url ? `Running on ${url}` : `${manifest.name} is open`)
+    durations[phase] += Date.now() - phaseSince
+    patchState(app.id, key, {
+      url,
+      device,
+      lastLaunch: new Date().toISOString(),
+      running: detached,
+      ...(worked ? { durations } : {})
+    })
+    emit('running', url ? `Running on ${url}` : device ? `${manifest.name} is open on ${device}` : `${manifest.name} is open`)
     send(win, 'branch:updated', { key })
     return { status: 'running', url }
   } catch (err) {
@@ -96,6 +143,7 @@ export async function startBranch(win: BrowserWindow, key: string): Promise<Star
 
     if (err instanceof ApprovalRequired) {
       log.line('[approval] waiting for the user to review the manifest')
+      pending.set(key, err.approval)
       emit('done', 'Waiting for your approval')
       send(win, 'job:approval', { key, approval: err.approval })
       send(win, 'branch:updated', { key })
@@ -156,7 +204,12 @@ export async function reattach(getWindow: () => BrowserWindow | null): Promise<v
   }
 }
 
-/** Conditional requests, so re-checking an unchanged branch costs no rate limit. */
+/** Branches checked without the tester asking: local clones always, GitHub ones with a token only. */
+export function checkedFreely(list: Branch[]): Branch[] {
+  return hasGithubToken() ? list : list.filter((branch) => branch.kind === 'local')
+}
+
+/** One conditional request per GitHub branch: free with a token, counted without one. A clone is read locally. */
 export async function refresh(win: BrowserWindow, list: Branch[]): Promise<void> {
   for (const branch of list) {
     const remoteSha = await checkRemote(branch)
@@ -172,6 +225,7 @@ function fail(win: BrowserWindow, error: JobError): void {
   appLog(`[job] ${error.key} failed at ${error.step}: ${error.message.split('\n')[0]}`)
   send<JobError>(win, 'job:error', {
     ...error,
+    phase: phaseOf(error.step),
     logTail: tidyTail(error.logTail),
     hint: hintFor(`${error.message}\n${error.logTail}`)
   })

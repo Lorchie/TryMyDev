@@ -3,12 +3,13 @@ import { BrowserWindow } from 'electron'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
+import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { BranchLog } from './logger'
 import { appShared, branchDataDir, checkoutDir, shortDir, shortOwnerPath } from './paths'
 import type { Toolchain } from './proc'
-import { adopt, expectedElectronMajor, isRunning, launch, needsOwnElectron, stop, type LaunchResult } from './runner'
+import { adopt, expectedElectronMajor, expoUrl, reportSource, isRunning, launch, needsOwnElectron, stop, untilStopped, type LaunchResult } from './runner'
 import { setPreference } from './settings'
 import { cleanup, isAlive, until, useUserData } from './testing'
 import type { App, Branch, Manifest } from './types'
@@ -44,7 +45,7 @@ after(() => cleanup(data))
 
 function branch(files: Record<string, string> = {}): Branch {
   const ref = `b${++count}`
-  const b: Branch = { key: `${ref}-00000000`, appId: app.id, owner: 'o', repo: 'r', ref, addedAt: '' }
+  const b: Branch = { key: `${ref}-00000000`, appId: app.id, kind: 'github', owner: 'o', repo: 'r', ref, addedAt: '' }
   const dir = checkoutDir(app.id, b.key)
   mkdirSync(dir, { recursive: true })
   for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content)
@@ -136,6 +137,16 @@ describe('launch', () => {
     assert.equal(run.exit(), null)
     assert.equal(isRunning(b.key), false)
     await assert.rejects(fetch(run.url!))
+  })
+
+  it('lets a start asked right after Stop wait for the process to be gone', async () => {
+    const b = branch({ 'server.js': server })
+    const run = await start(b, { name: 'Web', start: { mode: 'web', run: 'node server.js {port}', port: 4650 } })
+    stop(b.key)
+    assert.equal(isRunning(b.key), true, 'still there while its process ends')
+    await untilStopped(b.key)
+    assert.equal(isRunning(b.key), false)
+    assert.equal(run.exit(), null)
   })
 
   it('gives two branches of one application two ports', async () => {
@@ -391,5 +402,22 @@ describe('adopt', () => {
     await until(() => gone, 10_000)
     assert.equal(isRunning('adopted-00000000'), false)
     assert.equal(isAlive(child.pid!), false)
+  })
+})
+
+describe('expoUrl', () => {
+  it('keeps the address Expo printed, else builds it from a private address of this computer', () => {
+    assert.equal(expoUrl('exp://192.168.1.20:8082', 8082), 'exp://192.168.1.20:8082')
+    assert.match(expoUrl('http://localhost:8082', 8082), /^exp:\/\/[\d.]+:8082$/)
+  })
+})
+
+describe('reportSource', () => {
+  it("masks the tester's user folder in a local clone's path", () => {
+    const path = join(homedir(), 'code', 'app')
+    const source = reportSource({ kind: 'local', path, key: 'k', appId: 'a', addedAt: '' }, { sha: 'abc' }, { path: 'x.log' } as never)
+    assert.ok(!source.source.includes(homedir()), source.source)
+    assert.match(source.source, /code[\\/]app · working tree$/)
+    assert.equal(source.commit, 'abc')
   })
 })

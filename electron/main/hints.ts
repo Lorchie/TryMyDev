@@ -21,6 +21,36 @@ const HINTS: { pattern: RegExp; hint: (match: RegExpMatchArray) => string }[] = 
       'application in CPU mode if it has one.'
   },
   {
+    pattern: /Project is incompatible with this version of Expo Go|SDK version .* is not supported|Expo Go .* does not support/i,
+    hint: () =>
+      'The Expo Go app on the phone runs another Expo SDK than the project. Expo Go only carries the latest ' +
+      'SDK: the developer can upgrade the project, or ship a development build instead.'
+  },
+  {
+    pattern: /Unsupported class file major version|requires Java \d+|Android Gradle plugin requires Java (\d+)/,
+    hint: (m) =>
+      `The build needs another Java version${m[1] ? ` (${m[1]})` : ''}. The manifest picks it with "runtime": { "java": "${m[1] ?? '21'}" }.`
+  },
+  {
+    pattern: /SDK location not found|ANDROID_HOME|licen[cs]es? for the following SDK packages have not been accepted/i,
+    hint: () =>
+      'Gradle did not find the Android SDK TryMyDev prepared. Starting again prepares it; if it persists, ' +
+      'a local.properties file in the project may point at the developer\'s own SDK — remove its sdk.dir line.'
+  },
+  {
+    // aapt2 says "Universal C Runtime"; the real cause is its own path, past 260 characters.
+    pattern: /AAPT2 .*Daemon startup failed|CreateProcess error=206/,
+    hint: () =>
+      'A tool of the Android build could not start, most often because its path is longer than Windows allows ' +
+      '(260 characters) — a long user name, or a data folder moved deep. Enabling long paths in Windows ' +
+      '(LongPathsEnabled) removes the limit.'
+  },
+  {
+    pattern: /no devices\/emulators found|device offline|device '.*' not found/i,
+    hint: () =>
+      'The device was disconnected. Plug the phone back in (with a cable that carries data), unlock it, and start again.'
+  },
+  {
     pattern: /EADDRINUSE|address already in use|Only one usage of each socket address/i,
     hint: () =>
       'The port is already taken, often by another copy of the application. Stop it, or let ' +

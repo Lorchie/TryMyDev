@@ -9,6 +9,7 @@ interface SettingsFile {
   autoCleanup?: boolean
   overlay?: boolean
   agent?: boolean
+  theme?: Theme
   /** Sealed like the GitHub token. */
   agentToken?: string
 }
@@ -24,6 +25,24 @@ export interface Preferences {
 }
 
 export const PREFERENCE_NAMES = ['autoCleanup', 'overlay', 'agent'] as const
+
+/** How the TryMyDev window looks: Electron's own names, so it is handed to `nativeTheme` as it is. */
+export type Theme = 'system' | 'dark' | 'light'
+const THEMES: Theme[] = ['system', 'dark', 'light']
+
+/** Dark unless the tester chose otherwise. */
+export function theme(): Theme {
+  const chosen = readJson<SettingsFile>(settingsPath(), {}).theme
+  return chosen && THEMES.includes(chosen) ? chosen : 'dark'
+}
+
+export function setTheme(value: Theme): Theme {
+  if (!THEMES.includes(value)) throw new Error(`Unknown appearance: ${String(value)}`)
+  const file = readJson<SettingsFile>(settingsPath(), {})
+  file.theme = value
+  writeJson(settingsPath(), file)
+  return value
+}
 
 export function preferences(): Preferences {
   const file = readJson<SettingsFile>(settingsPath(), {})

@@ -22,6 +22,7 @@ export function localChannel(target: AgentTarget): Channel {
 const REQUEST_MS = 20_000
 /** An application whose windows are not up yet, or still connecting, is waited for this long. */
 const CONNECT_MS = 60_000
+const HELLO_CHARS = 1024
 
 /**
  * A pipe for one launch of an Electron application: its path and secret go to the
@@ -60,6 +61,8 @@ export function pipeChannel(): { info: AgentLinkInfo; channel: Channel } {
         }
         settle(line)
       }
+      // The secret fits in one short line: a program sending more without one is not the application.
+      if (!trusted && buffer.length > HELLO_CHARS) incoming.destroy()
     })
     incoming.on('error', () => undefined)
     incoming.on('close', () => {

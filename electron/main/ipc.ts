@@ -1,16 +1,22 @@
-import { clipboard, dialog, ipcMain, shell, type BrowserWindow } from 'electron'
+import { app as electronApp, clipboard, dialog, ipcMain, nativeImage, nativeTheme, shell, type BrowserWindow } from 'electron'
 import { appendFileSync, mkdirSync } from 'fs'
-import { dirname } from 'path'
+import { writeFile } from 'fs/promises'
+import { homedir, hostname } from 'os'
+import { basename, dirname, join } from 'path'
+import QRCode from 'qrcode'
+import { redactText } from '../overlay/redact'
+import { reportArchive, reportFileName, reportMarkdown, type ReportData } from '../overlay/report'
+import { AndroidDriver } from './android'
 import { agentStatus, claudeCommand, syncAgent } from './agent'
 import { appLog, errorText } from './applog'
 import { manifestOfApp, refusedFolder, resolveFolders, type FolderView } from './folders'
-import { rateLimit, resolveSource } from './github'
+import { rateLimit } from './github'
 import * as jobs from './jobs'
 import { validate } from './manifest'
 import { appLogPath, logsDir } from './paths'
 import { readState } from './provision'
 import * as registry from './registry'
-import { isRunning } from './runner'
+import { driver, isRunning } from './runner'
 import { forgetBranchSession, openExternalSafely, samePlace } from './security'
 import {
   agentToken,
@@ -19,19 +25,29 @@ import {
   renewAgentToken,
   setGithubToken,
   setPreference,
-  type Preferences
+  setTheme,
+  theme,
+  type Preferences,
+  type Theme
 } from './settings'
 import { createShortcut } from './shortcut'
-import { parseInput } from './source-url'
+import { appFor, resolveInput } from './sources'
+import { refLabel, sourceName } from './source-url'
 import { prune, usage } from './storage'
 import type { App, Branch, Manifest } from './types'
 
-export interface BranchView extends Branch {
+export type BranchView = Branch & {
+  /** `owner/repo`, or the folder of a local clone. */
+  name: string
   label: string
   builtSha?: string
   url?: string
+  /** The Android device it runs on. */
+  device?: string
   running: boolean
   busy: boolean
+  /** Running on Android: its bug report is written from this window, the overlay being out of reach. */
+  reportable: boolean
 }
 
 export interface AppView extends App {
@@ -42,11 +58,15 @@ function branchView(branch: Branch): BranchView {
   const state = readState(branch.appId, branch.key)
   return {
     ...branch,
+    name: sourceName(branch),
+    ref: refLabel(branch),
     label: registry.label(branch),
     builtSha: state.builtSha,
     url: state.url,
+    device: isRunning(branch.key) ? state.device : undefined,
     running: isRunning(branch.key),
-    busy: jobs.busy(branch.key)
+    busy: jobs.busy(branch.key),
+    reportable: driver(branch.key) instanceof AndroidDriver
   }
 }
 
@@ -96,10 +116,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
       manifest = validate(manifestText, 'the manifest you pasted')
     }
 
-    const { source, upstream } = await resolveSource(parseInput(input))
-    const app = registry.addApp(manifest?.repo ?? upstream, manifest)
-    registry.addBranch(app.id, source)
+    const resolved = await resolveInput(input)
+    registry.addBranch(appFor(resolved, manifest).id, resolved.source)
     return view()
+  })
+
+  // A local clone, picked with the system's folder dialog; git says later whether it is one.
+  handle('dialog:pickRepository', async () => {
+    const win = getWindow()
+    const options = { title: 'Local Git repository', properties: ['openDirectory'] as Array<'openDirectory'> }
+    const picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    return picked.canceled ? null : (picked.filePaths[0] ?? null)
   })
 
   handle('apps:remove', (appId: string) => {
@@ -153,7 +180,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
   })
 
   handle('branches:add', async (appId: string, input: string) => {
-    const { source } = await resolveSource(parseInput(input))
+    const { source } = await resolveInput(input)
     registry.addBranch(appId, source)
     return view()
   })
@@ -173,10 +200,75 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
 
   handle('branches:cancel', (key: string) => jobs.cancel(key))
 
-  handle('branches:refresh', async () => {
+  // Anonymous, even a 304 counts against GitHub's 60 calls an hour: without a token, GitHub
+  // branches are checked when the tester asks, one application at a time. Local clones are free.
+  handle('branches:refresh', async (appId?: string, automatic?: boolean) => {
     const win = getWindow()
-    if (win) await jobs.refresh(win, registry.branches())
+    if (win) {
+      const list = registry.branches(typeof appId === 'string' ? appId : undefined)
+      await jobs.refresh(win, automatic === true ? jobs.checkedFreely(list) : list)
+    }
     return view()
+  })
+
+  // Expo Go opens the dev server from a QR code; only its addresses are drawn.
+  handle('qr:image', (text: string) => {
+    if (typeof text !== 'string' || !/^exp:\/\/[\w.-]+:\d+$/.test(text)) throw new Error('Refused: not an Expo address.')
+    return QRCode.toDataURL(text, { margin: 1, width: 240 })
+  })
+
+  // A report of an application on Android: prepared once, previewed as the tester describes, saved where they choose.
+  const reports = new Map<string, { data: ReportData; screenshot?: Buffer }>()
+  const android = (key: string): AndroidDriver => {
+    const found = driver(key)
+    if (!(found instanceof AndroidDriver)) throw new Error('This branch is not running on Android.')
+    return found
+  }
+  const described = (data: ReportData, description: unknown): string =>
+    typeof description === 'string' ? redactText(description.slice(0, 10_000), { home: homedir(), hostname: hostname() }) : ''
+
+  handle('report:start', async (key: string) => {
+    const d = android(key)
+    const data = await d.reportData()
+    const screenshot = await d.capture().catch(() => undefined)
+    reports.set(key, { data, screenshot })
+    const image = screenshot ? nativeImage.createFromBuffer(screenshot) : undefined
+    return {
+      markdown: reportMarkdown(data, ''),
+      logs: data.log.join('\n'),
+      screenshot: image && !image.isEmpty() ? image.resize({ width: 240 }).toDataURL() : undefined
+    }
+  })
+
+  handle('report:preview', (key: string, description: string) => {
+    const report = reports.get(key)
+    return report ? reportMarkdown(report.data, described(report.data, description)) : ''
+  })
+
+  handle('report:save', async (key: string, description: string, withScreenshot: boolean) => {
+    const report = reports.get(key)
+    const win = getWindow()
+    if (!report || !win) return null
+    let folder: string
+    try {
+      folder = electronApp.getPath('desktop')
+    } catch {
+      folder = homedir()
+    }
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: 'Save the bug report',
+      defaultPath: join(folder, reportFileName(report.data.label, report.data.at)),
+      filters: [{ name: 'Zip archive', extensions: ['zip'] }]
+    })
+    if (canceled || !filePath) return null
+    await writeFile(filePath, reportArchive(report.data, described(report.data, description), withScreenshot === false ? undefined : report.screenshot))
+    reports.delete(key)
+    shell.showItemInFolder(filePath)
+    return basename(filePath)
+  })
+
+  handle('report:close', (key: string) => {
+    reports.delete(key)
   })
 
   handle('branches:shortcut', (key: string) => {
@@ -191,7 +283,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
   handle('manifest:approve', async (appId: string, hash: string, key: string) => {
     const branch = registry.getBranch(key)
     if (branch.appId !== appId) throw new Error(`Refused: ${key} is not a branch of ${appId}.`)
-    registry.approveApp(branch.appId, hash, branch)
+    const shown = jobs.pendingApproval(key)
+    registry.approveApp(branch.appId, hash, branch, shown?.manifestHash === hash ? shown.commands : undefined)
     const win = getWindow()
     if (win) await jobs.startBranch(win, key)
   })
@@ -202,7 +295,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
 
   const settings = (): Record<string, unknown> => {
     const { error } = agentStatus()
-    return { githubToken: hasGithubToken(), ...preferences(), ...(error ? { agentError: error } : {}) }
+    return { githubToken: hasGithubToken(), ...preferences(), theme: theme(), ...(error ? { agentError: error } : {}) }
   }
   handle('settings:get', () => settings())
   handle('settings:setGithubToken', async (token: string | null) => {
@@ -217,6 +310,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, home: string)
   handle('settings:setPreference', async (name: keyof Preferences, value: boolean) => {
     setPreference(name, value)
     if (name === 'agent') await syncAgent(value, getWindow)
+    return settings()
+  })
+  handle('settings:setTheme', (value: Theme) => {
+    nativeTheme.themeSource = setTheme(value)
     return settings()
   })
   // The token goes from here to the clipboard: the window never holds it.

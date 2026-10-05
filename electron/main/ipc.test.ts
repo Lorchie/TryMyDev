@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { clipboard, dialog, ipcMain } from 'electron'
+import { clipboard, dialog, ipcMain, nativeTheme } from 'electron'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -60,7 +60,7 @@ before(() => {
     ],
     branches: [{ key: 'main-00000000', appId: 'o-r', owner: 'o', repo: 'r', ref: 'main', addedAt: '' }]
   })
-  registerIpc(() => ({ webContents: { id: 7 } }) as never, HOME)
+  registerIpc(() => ({ webContents: { id: 7, send: () => undefined }, isDestroyed: () => false }) as never, HOME)
 })
 after(() => cleanup(data, outside))
 
@@ -127,20 +127,53 @@ describe('IPC', () => {
   })
 
   it('switches a preference, and nothing else', async () => {
-    assert.deepEqual(await call('settings:get', 7), { githubToken: false, autoCleanup: true, overlay: true, agent: false })
+    assert.deepEqual(await call('settings:get', 7), {
+      githubToken: false,
+      autoCleanup: true,
+      overlay: true,
+      agent: false,
+      theme: 'dark'
+    })
     assert.deepEqual(await call('settings:setPreference', 7, 'overlay', false), {
       githubToken: false,
       autoCleanup: true,
       overlay: false,
-      agent: false
+      agent: false,
+      theme: 'dark'
     })
     await assert.rejects(call('settings:setPreference', 7, 'githubToken', true), /Unknown setting/)
     await call('settings:setPreference', 7, 'overlay', true)
   })
 
+  it('sets the appearance, and hands it to the window', async () => {
+    assert.equal(((await call('settings:setTheme', 7, 'light')) as { theme: string }).theme, 'light')
+    assert.equal(nativeTheme.themeSource, 'light')
+    await assert.rejects(call('settings:setTheme', 7, 'sepia'), /Unknown appearance/)
+    await call('settings:setTheme', 7, 'dark')
+  })
+
   it('copies through the main process, the window being sandboxed', async () => {
     await call('app:copy', 7, 'the report')
     assert.equal((clipboard as unknown as { text: string }).text, 'the report')
+  })
+
+  it('checks branches on GitHub without a token only when asked, one application at a time', async () => {
+    const realFetch = globalThis.fetch
+    const asked: string[] = []
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      asked.push(String(input))
+      return new Response('a'.repeat(40))
+    }) as typeof fetch
+    try {
+      await call('branches:refresh', 7, undefined, true)
+      assert.deepEqual(asked, [], 'an automatic check without a token costs nothing')
+      await call('branches:refresh', 7, 'o-other')
+      assert.deepEqual(asked, [], 'another application has no branch')
+      await call('branches:refresh', 7, 'o-r')
+      assert.equal(asked.length, 1)
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 
   it('opens only web addresses in the browser', async () => {

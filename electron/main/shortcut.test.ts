@@ -23,7 +23,7 @@ describe('createShortcut', { skip: process.platform === 'win32' ? false : 'Windo
   it('writes a desktop shortcut that starts the branch directly', () => {
     const path = createShortcut(
       { id: 'modly', name: 'Modly', addedAt: '' },
-      { key: 'feat-x-00000000', appId: 'modly', owner: 'someone', repo: 'modly', ref: 'feat/x', addedAt: '' }
+      { key: 'feat-x-00000000', appId: 'modly', kind: 'github', owner: 'someone', repo: 'modly', ref: 'feat/x', addedAt: '' }
     )
     const [shortcut] = written
 
@@ -38,7 +38,7 @@ describe('createShortcut', { skip: process.platform === 'win32' ? false : 'Windo
     try {
       createShortcut(
         { id: 'modly', name: 'Modly', addedAt: '' },
-        { key: 'dev-00000000', appId: 'modly', owner: 'lightningpixel', repo: 'modly', ref: 'dev', addedAt: '' }
+        { key: 'dev-00000000', appId: 'modly', kind: 'github', owner: 'lightningpixel', repo: 'modly', ref: 'dev', addedAt: '' }
       )
       assert.equal(written.at(-1)?.details.args, '--start=lightningpixel/modly@dev')
     } finally {

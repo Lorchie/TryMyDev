@@ -104,7 +104,7 @@ describe('an agent driving an Electron application', () => {
     assert.match(text, /heading "Mesh tools"/)
     assert.match(text, /button "Export mesh" \[ref=e\d+\]/)
     assert.match(text, /textbox "Your name"/)
-    assert.doesNotMatch(text, /TryMyDev tools|Report bug/)
+    assert.doesNotMatch(text, /TryMyDev tools|Report a bug/)
   })
 
   it('clicks as a person does: the page reacts, the journal records the click and the error', async () => {

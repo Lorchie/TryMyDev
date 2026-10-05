@@ -20,7 +20,7 @@ import {
   storeDir,
   venvStore
 } from './paths'
-import { CACHE_IDLE_MS, ensureFreeSpace, prune, setIdleCachesAside, usage } from './storage'
+import { CACHE_IDLE_MS, ensureFreeSpace, prune, setIdleCachesAside, usage, type UsageEntry } from './storage'
 import { cleanup, useUserData } from './testing'
 
 const kind = process.platform === 'win32' ? 'junction' : 'dir'
@@ -50,6 +50,9 @@ before(() => {
 
   put(join(nodeModulesStore('kept-node'), 'dep', 'index.js'), 20_000)
   put(join(nodeModulesStore('stale-node'), 'dep', 'index.js'), 1_000)
+  // npm workspaces link a package of the checkout into node_modules.
+  link(join(checkoutDir('app', MAIN), 'packages', 'ui'), join(nodeModulesStore('stale-node'), 'ui'))
+  put(join(checkoutDir('app', MAIN), 'packages', 'ui', 'index.js'))
   put(join(venvStore('stale-venv'), 'pyvenv.cfg'))
   mkdirSync(venvStore('kept-venv'), { recursive: true })
   writeFileSync(join(venvStore('kept-venv'), 'pyvenv.cfg'), `home = ${join(legacy, 'python-3.11.9')}\n`)
@@ -104,6 +107,21 @@ describe('usage', () => {
     for (let i = 1; i < entries.length; i++) assert.ok(entries[i - 1].bytes >= entries[i].bytes)
   })
 
+  it('groups what it reports: each application with its branches, then tools, environments, caches and leftovers', async () => {
+    const entries = await usage()
+    const group = (label: RegExp): Pick<UsageEntry, 'group' | 'appId' | 'key'> | undefined => {
+      const entry = entries.find((e) => label.test(e.label))
+      return entry && { group: entry.group, appId: entry.appId, key: entry.key }
+    }
+
+    assert.deepEqual(group(/^App · main$/), { group: 'App', appId: 'app', key: MAIN })
+    assert.deepEqual(group(/^App · short-path folder$/), { group: 'App', appId: 'app', key: undefined })
+    assert.equal(group(/^Runtime · node-22/)?.group, 'Tools')
+    assert.equal(group(/^Node dependencies · kept-nod/)?.group, 'Environments')
+    assert.equal(group(/^Download cache · uv$/)?.group, 'Download caches')
+    assert.equal(group(/^Removed application · removed$/)?.group, 'Leftovers')
+  })
+
   it('counts a runtime once, not again through the link uv makes to it', async () => {
     const pythons = (await usage()).filter((e) => e.label.startsWith('Runtime · cpython-3.13'))
     assert.deepEqual(pythons.map((e) => e.label), ['Runtime · cpython-3.13.7-windows-x86_64-none'])
@@ -130,6 +148,7 @@ describe('prune', () => {
     assert.ok(existsSync(join(nodeModulesStore('kept-node'), 'dep', 'index.js')))
     assert.ok(existsSync(venvStore('kept-venv')))
     assert.ok(existsSync(join(checkoutDir('app', MAIN), 'main.js')))
+    assert.ok(existsSync(join(checkoutDir('app', MAIN), 'packages', 'ui', 'index.js')), 'a workspace link is not followed')
     assert.ok(existsSync(join(storeDir(), 'node', 'node-22.23.2-win-x64', 'node.exe')), 'runtimes are kept')
     assert.ok(existsSync(legacy), 'an earlier Python still in use is kept')
     assert.ok(existsSync(cacheDir('uv')), 'caches only go when asked')

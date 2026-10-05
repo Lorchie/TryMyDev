@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { BrowserWindow } from 'electron'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -116,6 +117,25 @@ describe('the pipe between TryMyDev and an application', () => {
         ]),
         /still waiting for the real application/
       )
+    } finally {
+      channel.close()
+    }
+  })
+
+  it('disconnects a program that sends more than a secret without a line break', async () => {
+    const { info, channel } = pipeChannel()
+    try {
+      const closed = await new Promise<boolean>((resolve) => {
+        const socket = createConnection(info.pipe)
+        socket.on('connect', () => socket.write('x'.repeat(4096)))
+        socket.on('close', () => resolve(true))
+        socket.on('error', () => undefined)
+        setTimeout(() => {
+          socket.destroy()
+          resolve(false)
+        }, 1500)
+      })
+      assert.equal(closed, true)
     } finally {
       channel.close()
     }

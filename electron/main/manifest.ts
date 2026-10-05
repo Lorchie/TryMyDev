@@ -1,10 +1,12 @@
 import { existsSync, readFileSync } from 'fs'
-import { isAbsolute, join } from 'path'
+import { basename, isAbsolute, join } from 'path'
 import { detectManifest } from './detect'
 import { hashString } from './fsx'
 import { machine, matches } from './machine'
 import { builtinFor } from './profiles/builtin'
 import { FOLDER_PLACEHOLDERS, PLACEHOLDER, ROOT_PLACEHOLDERS } from './seed'
+import { githubRepo, sourceName } from './source-url'
+import { LICENCE_URL } from './runtimes/android'
 import {
   PRODUCT,
   type App,
@@ -31,10 +33,11 @@ export function resolveManifest(checkout: string, app: App, src: Source): Manife
   if (fromRepo) return { ...fromRepo, source: 'repository' }
   if (app.manifest) return { ...app.manifest, source: 'provided' }
 
-  const builtin = builtinFor(app.repo ?? `${src.owner}/${src.repo}`)
+  const repo = app.repo ?? githubRepo(src)
+  const builtin = repo ? builtinFor(repo) : undefined
   if (builtin) return builtin
 
-  return detectManifest(checkout, `${src.owner}/${src.repo}`)
+  return detectManifest(checkout, githubRepo(src) ?? basename(sourceName(src)))
 }
 
 function readRepoManifest(checkout: string): Manifest | undefined {
@@ -42,6 +45,10 @@ function readRepoManifest(checkout: string): Manifest | undefined {
   if (!existsSync(path)) return undefined
   return validate(readFileSync(path, 'utf-8'), `${PRODUCT.manifestFile} of the repository`)
 }
+
+const MODES = ['electron', 'web', 'command', 'android', 'expo']
+/** An Android application id: letters, digits and underscores, in at least two dotted parts. */
+export const ANDROID_ID = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/
 
 /** Parses and checks a manifest, with errors a developer can act on. */
 export function validate(text: string, origin: string): Manifest {
@@ -58,17 +65,27 @@ export function validate(text: string, origin: string): Manifest {
   }
   const starts: unknown[] = Array.isArray(m.start) ? m.start : [m.start]
   if (!m.start || typeof m.start !== 'object' || starts.length === 0) {
-    throw new Error(`${origin}: "start" is required (mode electron, web or command).`)
+    throw new Error(`${origin}: "start" is required (mode ${MODES.join(', ')}).`)
   }
   for (const [index, start] of starts.entries()) {
     const where = Array.isArray(m.start) ? `start[${index}]` : 'start'
     if (!start || typeof start !== 'object') throw new Error(`${origin}: "${where}" must be an object.`)
     const mode = (start as { mode?: string }).mode
-    if (!['electron', 'web', 'command'].includes(mode ?? '')) {
-      throw new Error(`${origin}: "${where}.mode" must be electron, web or command.`)
+    if (!MODES.includes(mode ?? '')) {
+      throw new Error(`${origin}: "${where}.mode" must be ${MODES.join(', ')}.`)
     }
-    if (mode !== 'electron' && typeof (start as { run?: string }).run !== 'string') {
+    if (mode !== 'electron' && mode !== 'android' && typeof (start as { run?: string }).run !== 'string') {
       throw new Error(`${origin}: "${where}.run" is required for mode ${mode}.`)
+    }
+    if (mode === 'android') {
+      const android = start as { apk?: unknown; package?: unknown; artifact?: unknown }
+      if (android.apk !== undefined) inside(android.apk, `${origin}: "${where}.apk"`)
+      if (android.package !== undefined && (typeof android.package !== 'string' || !ANDROID_ID.test(android.package))) {
+        throw new Error(`${origin}: "${where}.package" must be an application id, such as com.example.app.`)
+      }
+      if (android.artifact !== undefined && (typeof android.artifact !== 'string' || android.artifact.trim() === '')) {
+        throw new Error(`${origin}: "${where}.artifact" must name a GitHub Actions artifact.`)
+      }
     }
     condition((start as { when?: unknown }).when, `${origin}: "${where}" when`)
   }
@@ -258,16 +275,33 @@ export function startFor(m: Manifest): StartSpec {
   return start
 }
 
-/** Whether a manifest needs a runtime: asked for explicitly, or implied by its commands. */
-export function wants(m: Manifest, kind: 'node' | 'python'): boolean {
-  if (m.runtime?.[kind] !== undefined) return true
+export type RuntimeKind = 'node' | 'python' | 'java' | 'android' | 'flutter'
+
+const TOOLS: Record<Exclude<RuntimeKind, 'java' | 'android'>, RegExp> = {
+  node: /^(npm|npx|node|electron)\b/,
+  python: /^(pip|pip3|python|python3|uv)\b/,
+  flutter: /^(flutter|dart)\b/
+}
+/** Gradle builds Android applications: it needs the SDK, and the SDK a JDK. */
+const GRADLE = /^(\.[\\/])?gradlew(\.bat)?\b/
+
+/**
+ * Whether a manifest needs a runtime: asked for explicitly, or implied by its commands. The
+ * Android SDK comes with Gradle and Flutter, the JDK with the SDK.
+ */
+export function wants(m: Manifest, kind: RuntimeKind): boolean {
   const start = startFor(m)
   const lines = [...stepsFor(m.install), ...stepsFor(m.build)]
     .map((s) => s.run)
-    .concat(start.mode === 'electron' ? 'electron' : start.run)
-  const tool = kind === 'node' ? /^(npm|npx|node|electron)\b/ : /^(pip|pip3|python|python3|uv)\b/
-  return lines.some((line) => tool.test(line))
+    .concat(start.mode === 'electron' ? 'electron' : start.mode === 'android' ? [] : start.run)
+  if (kind === 'android') return wants(m, 'flutter') || lines.some((line) => GRADLE.test(line))
+  if (kind === 'java') return m.runtime?.java !== undefined || wants(m, 'android')
+  if (m.runtime?.[kind] !== undefined) return true
+  return lines.some((line) => TOOLS[kind].test(line))
 }
+
+/** What an `android` start needs at launch, besides what builds the APK: adb, and a device. */
+export const startsOnAndroid = (m: Manifest): boolean => startFor(m).mode === 'android'
 
 /** Identity of a manifest's *behaviour*: what would run, not how it is formatted. */
 export function manifestHash(m: Manifest): string {
@@ -293,7 +327,16 @@ export function commandsOf(m: Manifest): string[] {
   const steps = [...stepsFor(m.install), ...stepsFor(m.build)].map((s) =>
     s.cwd ? `${s.run}    (in ${s.cwd})` : s.run
   )
-  return [...steps, start.mode === 'electron' ? 'launch the Electron application' : start.run]
+  return [...steps, launchLine(start)]
+}
+
+function launchLine(start: StartSpec): string {
+  if (start.mode === 'electron') return 'launch the Electron application'
+  if (start.mode === 'android') {
+    const from = start.artifact ? `the "${start.artifact}" artifact of GitHub Actions, else ${start.apk ?? 'the APK built'}` : (start.apk ?? 'the APK built')
+    return `install ${from} on an Android phone or emulator and open it`
+  }
+  return start.run
 }
 
 /** Everything besides commands that changes the disk or what the commands see. */
@@ -324,24 +367,54 @@ function settingsOf(m: Manifest): string[] {
  * Nothing is hidden or shortened: a manifest is arbitrary commands, and the person
  * running them is often not the person who wrote them.
  */
-export function approvalOf(app: App, m: Manifest, src: Source, warnings: string[] = []): Approval {
+export function approvalOf(
+  app: App,
+  m: Manifest,
+  src: Source,
+  warnings: string[] = [],
+  previous?: string[]
+): Approval {
+  const commands = commandsOf(m)
   const downloads: string[] = []
   if (wants(m, 'node')) downloads.push('Node.js runtime (~100 MB, once for every application)')
   if (wants(m, 'python')) downloads.push('Python runtime and uv (~150 MB, once for every application)')
-  downloads.push(`Sources of ${src.owner}/${src.repo}`)
+  if (wants(m, 'java')) downloads.push('Java runtime, Eclipse Temurin (~190 MB, once for every application)')
+  if (wants(m, 'flutter')) downloads.push('Flutter SDK (~1.5 GB, once for every application)')
+  const android = wants(m, 'android') || startsOnAndroid(m)
+  if (wants(m, 'android')) {
+    downloads.push('Android SDK command-line tools (~150 MB), then what the Gradle build asks for (often 1 GB or more)')
+  }
+  if (startsOnAndroid(m)) {
+    downloads.push('adb and scrcpy (~25 MB), to install the application on a phone and show its screen here')
+    downloads.push('Without a phone plugged in: the Android emulator and a system image (~2 GB, once)')
+  }
+  if (android) {
+    downloads.push(`Approving accepts the Android Software Development Kit License Agreement for you: ${LICENCE_URL}`)
+  }
+  if (startFor(m).mode === 'expo') {
+    downloads.push('Expo Go on the phone (Play Store or App Store) — not installed by TryMyDev')
+    warnings = [
+      ...warnings,
+      'While it runs, the Expo dev server — and the project\'s code it serves — can be reached by every device on this network, not only your phone. Use a network you trust, not a public Wi-Fi.'
+    ]
+  }
+  const local = src.kind === 'local'
+  const repo = sourceName(src)
+  if (!local) downloads.push(`Sources of ${repo}`)
 
-  const repo = `${src.owner}/${src.repo}`
   return {
     appId: app.id,
     appName: m.name,
     repo,
+    ...(local ? { local } : {}),
     upstream: app.repo,
-    foreign: app.repo !== undefined && app.repo.toLowerCase() !== repo.toLowerCase(),
+    foreign: !local && app.repo !== undefined && app.repo.toLowerCase() !== repo.toLowerCase(),
     manifestHash: manifestHash(m),
     source: m.source,
-    commands: commandsOf(m),
+    commands,
     settings: settingsOf(m),
     downloads,
-    warnings
+    warnings,
+    ...(previous ? { changed: commands.flatMap((command, index) => (previous.includes(command) ? [] : [index])) } : {})
   }
 }

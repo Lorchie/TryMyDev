@@ -3,11 +3,13 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFile
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import * as tar from 'tar'
+import { git, UNTRACKED_LIMIT } from './local-git'
 import { BranchLog } from './logger'
 import { manifestHash } from './manifest'
 import { checkoutDir, nodeCacheDir, nodeModulesStore } from './paths'
 import { ApprovalRequired, archiveGaps, provision, readState } from './provision'
 import * as registry from './registry'
+import { setGithubToken } from './settings'
 import { cleanup, installFakeNode, platformSlug, tempDir, useUserData } from './testing'
 import type { App, Manifest } from './types'
 
@@ -25,6 +27,8 @@ const heads = new Map<string, string>()
 const tarballs = new Map<string, Buffer>()
 let tarballCalls = 0
 let githubDown = false
+/** Set: GitHub lists an artifact for the commit, and fails to serve it. */
+let artifactZip: string | undefined
 
 let data: string
 let work: string
@@ -49,7 +53,7 @@ async function publish(ref: string, commit: string, lock = '{"lockfileVersion":3
 }
 
 async function prepare(ref: string, signal = new AbortController().signal): Promise<{ key: string; events: string[] }> {
-  const branch = registry.addBranch(app.id, { owner: 'o', repo: 'r', ref })
+  const branch = registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref })
   const events: string[] = []
   await provision(
     registry.getApp(app.id),
@@ -61,7 +65,7 @@ async function prepare(ref: string, signal = new AbortController().signal): Prom
   return { key: branch.key, events }
 }
 
-const approve = (m: Manifest): void => registry.approveApp(app.id, manifestHash(m), { owner: 'o', repo: 'r', ref: 'main' })
+const approve = (m: Manifest): void => registry.approveApp(app.id, manifestHash(m), { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' })
 
 before(async () => {
   data = useUserData()
@@ -78,6 +82,17 @@ before(async () => {
       const head = heads.get(decodeURIComponent(commit[1]))
       return head ? new Response(head) : new Response('{}', { status: 404, statusText: 'Not Found' })
     }
+    if (url.startsWith('https://raw.githubusercontent.com/o/r/HEAD/')) {
+      if (url.endsWith('/package-lock.json')) return new Response('{"lockfileVersion":3}')
+      if (url.endsWith('/install.js')) return new Response(INSTALL)
+      if (url.endsWith('/build.js')) return new Response(BUILD)
+      return new Response('404: Not Found', { status: 404 })
+    }
+    if (artifactZip !== undefined && /\/actions\/artifacts\?/.test(url)) {
+      const artifact = { id: 7, size_in_bytes: 10, expired: false, archive_download_url: 'https://api.github.com/artifact/7/zip', workflow_run: { head_sha: sha('d') } }
+      return new Response(JSON.stringify({ artifacts: [artifact] }))
+    }
+    if (url.endsWith('/artifact/7/zip')) return new Response(artifactZip ?? '', { status: 500, statusText: 'Server Error' })
     const tarball = url.match(/\/tarball\/(\w+)$/)
     if (tarball) {
       tarballCalls++
@@ -106,7 +121,7 @@ after(async () => {
 
 describe('provision', () => {
   it('stops for approval before running anything', async () => {
-    const branch = registry.addBranch(app.id, { owner: 'o', repo: 'r', ref: 'main' })
+    const branch = registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' })
     await assert.rejects(
       provision(registry.getApp(app.id), branch, new BranchLog(app.id, branch.key), () => undefined, new AbortController().signal),
       (err: unknown) => {
@@ -166,7 +181,7 @@ describe('provision', () => {
 
   it('installs nothing for another branch on the same lockfile', async () => {
     await publish('feature', sha('c'))
-    const main = readState(app.id, registry.addBranch(app.id, { owner: 'o', repo: 'r', ref: 'main' }).key)
+    const main = readState(app.id, registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }).key)
     const { key } = await prepare('feature')
 
     assert.equal(installs(), 'x')
@@ -179,7 +194,7 @@ describe('provision', () => {
 
   it('gives a different lockfile its own environment', async () => {
     await publish('upgrade', sha('d'), '{"lockfileVersion":3,"packages":{"dep":"2"}}')
-    const main = readState(app.id, registry.addBranch(app.id, { owner: 'o', repo: 'r', ref: 'main' }).key)
+    const main = readState(app.id, registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }).key)
     const { key } = await prepare('upgrade')
     assert.equal(installs(), 'xx')
     assert.notEqual(readState(app.id, key).nodeKey, main.nodeKey)
@@ -188,7 +203,7 @@ describe('provision', () => {
   it('asks again when the commands change, then installs a separate environment', async () => {
     const changed: Manifest = { ...manifest, install: [...(manifest.install ?? []), { run: 'node -e 0' }] }
     registry.addApp('o/r', changed)
-    const before = readState(app.id, registry.addBranch(app.id, { owner: 'o', repo: 'r', ref: 'main' }).key)
+    const before = readState(app.id, registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' }).key)
 
     await assert.rejects(prepare('main'), ApprovalRequired)
     approve(changed)
@@ -200,7 +215,7 @@ describe('provision', () => {
   })
 
   it('uses the runtime from the store', async () => {
-    const branch = registry.addBranch(app.id, { owner: 'o', repo: 'r', ref: 'main' })
+    const branch = registry.addBranch(app.id, { kind: 'github' as const, owner: 'o', repo: 'r', ref: 'main' })
     const { toolchain } = await provision(
       registry.getApp(app.id),
       branch,
@@ -242,7 +257,7 @@ describe('provision', () => {
 
   it('asks again before running the same manifest on code from another repository', async () => {
     await publish('stranger', sha('9'))
-    const branch = registry.addBranch(app.id, { owner: 'stranger', repo: 'r', ref: 'stranger' })
+    const branch = registry.addBranch(app.id, { kind: 'github' as const, owner: 'stranger', repo: 'r', ref: 'stranger' })
     await assert.rejects(
       provision(registry.getApp(app.id), branch, new BranchLog(app.id, branch.key), () => undefined, new AbortController().signal),
       (err: unknown) => {
@@ -255,6 +270,116 @@ describe('provision', () => {
       }
     )
     assert.equal(installs(), 'xxxx', 'nothing ran')
+  })
+
+  it('builds a local folder as it is, uncommitted changes included, without GitHub', async () => {
+    const clone = join(work, 'local clone')
+    mkdirSync(clone)
+    await git(['init', '-q', '-b', 'main'], clone)
+    for (const [key, value] of [['user.email', 'tester@example.com'], ['user.name', 'Tester'], ['commit.gpgsign', 'false']]) {
+      await git(['config', key, value], clone)
+    }
+    writeFileSync(join(clone, 'package-lock.json'), '{"lockfileVersion":3}')
+    writeFileSync(join(clone, 'install.js'), INSTALL)
+    writeFileSync(join(clone, 'build.js'), BUILD)
+    await git(['add', '.'], clone)
+    await git(['commit', '-q', '-m', 'first'], clone)
+    const commit = await git(['rev-parse', 'main'], clone)
+
+    const own = registry.addApp('o/clone-test', { ...manifest, name: 'Clone' })
+    githubDown = true
+    const calls = tarballCalls
+    try {
+      const source = { kind: 'local' as const, path: clone }
+      const branch = registry.addBranch(own.id, source)
+      const run = (b = branch): Promise<unknown> =>
+        provision(registry.getApp(own.id), b, new BranchLog(own.id, b.key), () => undefined, new AbortController().signal)
+
+      let hash = ''
+      await assert.rejects(run(), (err: unknown) => {
+        assert.ok(err instanceof ApprovalRequired, 'approved for o/r, not for this folder')
+        assert.equal(err.approval.local, true)
+        assert.equal(err.approval.repo, clone)
+        assert.equal(err.approval.foreign, false)
+        hash = err.approval.manifestHash
+        return true
+      })
+      registry.approveApp(own.id, hash, source)
+      await run()
+      const installed = installs()
+      assert.equal(readState(own.id, branch.key).builtSha, commit)
+      assert.equal(readFileSync(join(checkoutDir(own.id, branch.key), 'built.txt'), 'utf-8'), 'from dep')
+
+      writeFileSync(join(clone, 'build.js'), `require('fs').writeFileSync('built.txt', 'uncommitted')`)
+      await run()
+      assert.notEqual(readState(own.id, branch.key).builtSha, commit)
+      assert.equal(readFileSync(join(checkoutDir(own.id, branch.key), 'built.txt'), 'utf-8'), 'uncommitted')
+      assert.equal(tarballCalls, calls, 'nothing downloaded')
+      assert.equal(installs(), installed, 'the dependencies of the same lockfile are reused')
+
+      const lines: string[] = []
+      const again = new BranchLog(own.id, branch.key)
+      again.onLine((line) => lines.push(line))
+      await provision(registry.getApp(own.id), branch, again, () => undefined, new AbortController().signal)
+      assert.match(lines.join('\n'), /unchanged[\s\S]*already built/, 'an unchanged folder starts at once')
+
+      // A refusal of the folder is read, never covered by the cached build.
+      writeFileSync(join(clone, 'weights.bin'), Buffer.alloc(4096))
+      const limit = UNTRACKED_LIMIT.bytes
+      UNTRACKED_LIMIT.bytes = 1024
+      try {
+        await assert.rejects(run(), /untracked file[\s\S]*weights\.bin/)
+      } finally {
+        UNTRACKED_LIMIT.bytes = limit
+      }
+    } finally {
+      githubDown = false
+    }
+  })
+
+  it("compares a fork's install files with the official repository before asking", async () => {
+    await publish('fork-branch', sha('e'))
+    const branch = registry.addBranch(app.id, { kind: 'github' as const, owner: 'someone', repo: 'r', ref: 'fork-branch' })
+    await assert.rejects(
+      provision(registry.getApp(app.id), branch, new BranchLog(app.id, branch.key), () => undefined, new AbortController().signal),
+      (err: unknown) => {
+        assert.ok(err instanceof ApprovalRequired)
+        assert.equal(err.approval.foreign, true)
+        assert.deepEqual(err.approval.install, { against: 'o/r', changes: [] }, 'same lockfile, nothing else to compare')
+        return true
+      }
+    )
+  })
+
+  it('builds the APK here when the artifact GitHub Actions built cannot be fetched', async () => {
+    const m: Manifest = {
+      name: 'Phone',
+      runtime: { node: '22' },
+      build: [{ run: `node -e "require('fs').mkdirSync('out');require('fs').writeFileSync('out/app.apk','')"` }],
+      start: { mode: 'android', apk: 'out', artifact: 'apk' }
+    }
+    const own = registry.addApp('o/phone', m)
+    const commit = sha('d')
+    await publish('phone', commit)
+    const src = { kind: 'github' as const, owner: 'o', repo: 'phone', ref: 'phone' }
+    registry.approveApp(own.id, manifestHash(m), src)
+    setGithubToken('ghp_test')
+    artifactZip = 'broken'
+    try {
+      const branch = registry.addBranch(own.id, src)
+      const lines: string[] = []
+      const log = new BranchLog(own.id, branch.key)
+      log.onLine((line) => lines.push(line))
+      await provision(registry.getApp(own.id), branch, log, () => undefined, new AbortController().signal)
+      const state = readState(own.id, branch.key)
+      assert.equal(state.builtSha, commit)
+      assert.equal(state.apk, undefined, 'the APK built here is installed')
+      assert.ok(existsSync(join(checkoutDir(own.id, branch.key), 'out', 'app.apk')))
+      assert.match(lines.join('\n'), /\[prebuilt\][^\n]*building the APK here/)
+    } finally {
+      setGithubToken(undefined)
+      artifactZip = undefined
+    }
   })
 })
 

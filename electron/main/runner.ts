@@ -3,11 +3,15 @@ import { spawn, type ChildProcess } from 'child_process'
 import { closeSync, existsSync, openSync, readFileSync } from 'fs'
 import { mkdir } from 'fs/promises'
 import { createConnection, createServer } from 'net'
+import { homedir, hostname, networkInterfaces } from 'os'
 import { basename, join } from 'path'
 import { AgentTarget, type AgentLinkInfo } from '../overlay/agent'
 import { attachOverlay, type OverlayOptions } from '../overlay/attach'
+import { redactText } from '../overlay/redact'
+import type { ReportSource } from '../overlay/report'
 import { Journal, watchContents } from '../overlay/journal'
-import { Driver } from './drive'
+import { AndroidDriver, launchAndroid, findApk, stillRunning, stopAndroid, type AndroidLaunch } from './android'
+import { Driver, type AppDriver } from './drive'
 import { folderPaths, missingChosen, resolveFolders } from './folders'
 import { startFor } from './manifest'
 import { writeJson } from './fsx'
@@ -15,6 +19,7 @@ import {
   appShared,
   appSharedDir,
   branchDataDir,
+  branchDir,
   appIcon,
   checkoutDir,
   overlayFiles,
@@ -24,7 +29,7 @@ import {
   shortOwnerPath
 } from './paths'
 import { localChannel, pipeChannel } from './link'
-import { label as sourceLabel } from './registry'
+import { refLabel, sourceLabel } from './source-url'
 import { preferences } from './settings'
 import {
   buildEnv,
@@ -48,18 +53,45 @@ interface Running {
   /** Stopped on purpose: a forced kill exits non-zero, and that is no crash. */
   stopped?: boolean
   /** How an agent drives it, when agent access was on at its start. */
-  driver?: Driver
+  driver?: AppDriver
+  /** Ends what is not a process of this computer: an application on an Android device. */
+  onStop?: () => void
+  /** Called once its process is gone. */
+  gone?: Array<() => void>
 }
 
 const running = new Map<string, Running>()
+
+function forget(key: string): void {
+  const entry = running.get(key)
+  running.delete(key)
+  for (const done of entry?.gone ?? []) done()
+}
 
 export function isRunning(key: string): boolean {
   return running.has(key)
 }
 
 /** Absent for an application started without agent access, or taken back after a restart. */
-export function driver(key: string): Driver | undefined {
+export function driver(key: string): AppDriver | undefined {
   return running.get(key)?.driver
+}
+
+/**
+ * A stopped application keeps its entry until its process is gone: a start asked meanwhile —
+ * Stop then Run, or an agent's stop_branch then start_branch — waits for it instead of taking
+ * it for running.
+ */
+export function untilStopped(key: string, ms = 15_000): Promise<void> {
+  const entry = running.get(key)
+  if (!entry?.stopped) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    ;(entry.gone ??= []).push(() => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
 }
 
 export function stop(key: string): void {
@@ -67,13 +99,28 @@ export function stop(key: string): void {
   if (!entry) return
   entry.stopped = true
   closeWindow(entry.window)
-  killTree(entry.child ?? entry.pid)
+  if (entry.onStop) entry.onStop()
+  else killTree(entry.child ?? entry.pid)
+}
+
+/**
+ * What a bug report says of the branch. A local clone is a folder of the tester's, named by its
+ * path: masked like the rest of the report — their user folder and the computer's name.
+ */
+export function reportSource(branch: Branch, state: BranchState, log: BranchLog): ReportSource {
+  return {
+    source: redactText(sourceLabel(branch), { home: homedir(), hostname: hostname() }),
+    commit: state.builtSha ?? state.sha,
+    log: log.path
+  }
 }
 
 export interface LaunchResult {
   url?: string
   /** How to find a detached application again once TryMyDev has restarted. */
   detached?: BranchState['running']
+  /** The Android device it runs on. */
+  device?: string
 }
 
 export async function launch(
@@ -84,7 +131,9 @@ export async function launch(
   toolchain: Toolchain,
   log: BranchLog,
   signal: AbortSignal,
-  onExit: (code: number | null) => void
+  /** `reason` says how it ended when an exit code does not: an Android application's crash. */
+  onExit: (code: number | null, reason?: string) => void,
+  say: (message: string) => void = () => undefined
 ): Promise<LaunchResult> {
   const checkout = checkoutDir(app.id, branch.key)
   const data = branchDataDir(app.id, branch.key)
@@ -130,7 +179,7 @@ export async function launch(
 
   const ctx: RunContext = { toolchain, cwd: checkout, log, extraEnv }
   const start = startFor(manifest)
-  const label = `${manifest.name} · ${branch.ref}`
+  const label = `${manifest.name} · ${refLabel(branch)}`
   const { page, preload } = overlayFiles()
   // Switched off in Settings, the application starts exactly as it would without TryMyDev's tools.
   const overlay: OverlayOptions | undefined = preferences().overlay
@@ -139,7 +188,7 @@ export async function launch(
         preload,
         label,
         settings: overlaySettingsPath(app.id),
-        report: { source: sourceLabel(branch), commit: state.builtSha ?? state.sha, log: log.path }
+        report: reportSource(branch, state, log)
       }
     : undefined
   if (!overlay) log.line('[launch] tools overlay switched off in Settings')
@@ -160,6 +209,32 @@ export async function launch(
     if (driver) log.line('[launch] agent access on')
     track(branch.key, { child, pid: child.pid ?? 0, driver }, onExit, log)
     return { detached: identity(child) }
+  }
+
+  if (start.mode === 'android') {
+    const apk = state.apk ? join(branchDir(app.id, branch.key), state.apk) : findApk(checkout, start.apk)
+    const session = await launchAndroid({ checkout, apk, manifest, start, toolchain, log, label, say, signal })
+    const report = reportSource(branch, state, log)
+    trackAndroid(branch.key, session, new AndroidDriver(session, label, report), onExit, log)
+    return { device: `${session.device.model ?? session.device.serial}${session.device.emulator ? ' (emulator)' : ''}` }
+  }
+
+  if (start.mode === 'expo') {
+    const port = await freePort(start.port ?? 8081)
+    // Non-interactive: nothing asks the tester a question in a terminal they do not see.
+    const env = { ...extraEnv, CI: '1', EXPO_NO_TELEMETRY: '1' }
+    const child = startProcess(substitute(start.run, port), { ...ctx, extraEnv: env, signal })
+    let url: string
+    try {
+      const served = await waitForUrl(child, port, log)
+      url = expoUrl(served, port)
+    } catch (err) {
+      killTree(child)
+      throw err
+    }
+    track(branch.key, { child, pid: child.pid ?? 0 }, onExit, log)
+    log.line(`[launch] Expo Go opens ${url} — the phone must be on the same network as this computer`)
+    return { url }
   }
 
   if (start.mode === 'command') {
@@ -197,7 +272,7 @@ export function adopt(key: string, pid: number, onExit: () => void): void {
   const timer = setInterval(() => {
     if (isAlive(pid)) return
     clearInterval(timer)
-    running.delete(key)
+    forget(key)
     onExit()
   }, 2000)
   timer.unref()
@@ -212,7 +287,7 @@ function track(
   running.set(key, entry)
   entry.child.on('error', (err) => log.line(`[launch] ${err.message}`))
   entry.child.on('close', (code) => {
-    running.delete(key)
+    forget(key)
     entry.driver?.close()
     closeWindow(entry.window)
     log.line(`[launch] stopped (code ${code})`)
@@ -223,6 +298,59 @@ function track(
     entry.stopped = true
     killTree(entry.child)
   })
+}
+
+/**
+ * An application on an Android device has no process here: it is followed by its PID on the
+ * device. Gone with a crash recorded, it failed; gone otherwise — closed, or its mirror window
+ * closed — it simply ended.
+ */
+function trackAndroid(
+  key: string,
+  session: AndroidLaunch,
+  driver: AndroidDriver,
+  onExit: (code: number | null, reason?: string) => void,
+  log: BranchLog
+): void {
+  let done = false
+  const entry: Running = { pid: session.pid ?? 0, driver }
+  const finish = (code: number | null): void => {
+    if (done) return
+    done = true
+    clearInterval(timer)
+    forget(key)
+    void stopAndroid(session)
+    log.line(`[launch] stopped${code ? ' (crashed)' : ''}`)
+    onExit(entry.stopped ? null : code, code ? crash() : undefined)
+  }
+  entry.onStop = () => finish(null)
+  running.set(key, entry)
+  // The flush makes a crash whose last lines just came in count.
+  const crash = (): string | undefined => {
+    session.problems.flush()
+    return session.journal.snapshot().errors.find((e) => e.kind === 'crash')?.text
+  }
+  const timer = setInterval(() => {
+    void stillRunning(session).then((alive) => {
+      if (!alive) finish(crash() ? 1 : 0)
+    }, () => finish(1))
+  }, 3000)
+  timer.unref()
+  session.mirror?.on('close', () => finish(0))
+}
+
+/**
+ * Expo Go reaches the dev server over the network, at this computer's address: what Expo prints
+ * when it says it, else the first private IPv4 address of the computer.
+ */
+export function expoUrl(served: string, port: number): string {
+  if (served.startsWith('exp://')) return served
+  const addresses = Object.values(networkInterfaces())
+    .flat()
+    .filter((a): a is NonNullable<typeof a> => !!a && a.family === 'IPv4' && !a.internal)
+    .map((a) => a.address)
+  const lan = addresses.find((a) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a)) ?? addresses[0] ?? '127.0.0.1'
+  return `exp://${lan}:${port}`
 }
 
 /** A PID alone could be reused by another program; with its executable and start time it cannot. */
@@ -386,6 +514,9 @@ async function waitForUrl(child: ChildProcess, port: number | undefined, log: Br
   })
   const fromOutput = new Promise<string>((resolve, reject) => {
     const scan = (chunk: Buffer): void => {
+      // Expo says where Expo Go finds its server; that address wins over a local one.
+      const expo = chunk.toString().match(/exp:\/\/[\w.-]+:\d+/)
+      if (expo) return resolve(expo[0])
       const match = chunk.toString().match(/https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|\[::\])(:\d+)?\S*/)
       // A server listening on every address prints that address; it is reached on loopback.
       if (match) resolve(match[0].replace(/[).,]+$/, '').replace('//0.0.0.0', '//127.0.0.1').replace('//[::]', '//[::1]'))

@@ -73,8 +73,11 @@ export async function sha256File(path: string, length = 16): Promise<string> {
   return hash.digest('hex').slice(0, length)
 }
 
-export async function fileDigest(path: string): Promise<string> {
-  return sha256File(path, 64)
+export async function fileDigest(path: string, algorithm: 'sha256' | 'sha1' = 'sha256'): Promise<string> {
+  if (algorithm === 'sha256') return sha256File(path, 64)
+  const hash = createHash(algorithm)
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer)
+  return hash.digest('hex')
 }
 
 /** Removes a path without ever following a link into the shared stores. */

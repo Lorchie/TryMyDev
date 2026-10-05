@@ -70,8 +70,17 @@ export const shimDir = (runtimeId: string): string => join(storeDir(), 'shims', 
 /** Python installations, managed by uv. */
 export const pythonsDir = (): string => join(storeDir(), 'pythons')
 
+/**
+ * The Android SDK, shared by every application: platforms and build tools are added to it by
+ * Gradle as projects ask for them. Emulators and the SDK's own settings — its debug signing key
+ * among them — live beside it, never in the tester's ~/.android.
+ */
+export const androidSdkDir = (): string => join(storeDir(), 'android', 'sdk')
+export const androidUserDir = (): string => join(storeDir(), 'android', 'user')
+export const androidAvdDir = (): string => join(storeDir(), 'android', 'avd')
+
 /** Download caches of the tools TryMyDev runs — in the store, where Storage sees them. */
-export const CACHE_TOOLS = ['uv', 'npm', 'pip', 'electron'] as const
+export const CACHE_TOOLS = ['uv', 'npm', 'pip', 'electron', 'gradle', 'pub'] as const
 export type CacheTool = (typeof CACHE_TOOLS)[number]
 export const cacheDir = (tool: CacheTool): string => join(storeDir(), 'cache', tool)
 

@@ -44,6 +44,9 @@ function readPackage(checkout: string): PackageJson | undefined {
  * more: anything unusual is what the manifest is for.
  */
 export function detectManifest(checkout: string, fallbackName: string): Manifest {
+  const mobile = mobileProject(checkout, fallbackName)
+  if (mobile) return mobile
+
   const pkg = readPackage(checkout)
   const python = pythonProject(checkout)
   if (!pkg && !python) {
@@ -58,21 +61,8 @@ export function detectManifest(checkout: string, fallbackName: string): Manifest
   const build: Step[] = []
 
   if (pkg) {
-    if (!existsSync(join(checkout, 'package-lock.json'))) {
-      // pnpm and yarn are not provided yet, and installing with npm would silently
-      // resolve a different dependency tree than the project pins.
-      const other = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lockb'].find((f) =>
-        existsSync(join(checkout, f))
-      )
-      if (other) {
-        throw new Error(
-          `This project uses ${other.split('-')[0].replace('.lockb', '').replace('.lock', '')}, ` +
-            'which is not supported yet.\n' +
-            'Add a manifest describing its install and build commands.'
-        )
-      }
-    }
-    install.push({ run: 'npm install --dangerously-allow-all-scripts' })
+    npmOnly(checkout)
+    install.push(NPM_INSTALL)
     if (pkg.scripts?.build) build.push({ run: 'npm run build' })
   }
   if (python) install.push(...python.install)
@@ -90,6 +80,99 @@ export function detectManifest(checkout: string, fallbackName: string): Manifest
     },
     source: 'detected'
   }
+}
+
+/**
+ * pnpm and yarn are not provided yet, and installing with npm would silently resolve a
+ * different dependency tree than the project pins.
+ */
+function npmOnly(checkout: string): void {
+  if (existsSync(join(checkout, 'package-lock.json'))) return
+  const other = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lockb'].find((f) => existsSync(join(checkout, f)))
+  if (other) {
+    throw new Error(
+      `This project uses ${other.split('-')[0].replace('.lockb', '').replace('.lock', '')}, ` +
+        'which is not supported yet.\n' +
+        'Add a manifest describing its install and build commands.'
+    )
+  }
+}
+
+const hasGradle = (dir: string): boolean =>
+  existsSync(join(dir, 'gradlew')) && ['settings.gradle', 'settings.gradle.kts'].some((f) => existsSync(join(dir, f)))
+
+const NPM_INSTALL: Step = { run: 'npm install --dangerously-allow-all-scripts' }
+
+/**
+ * Mobile projects, the shapes most of them take: Flutter; an Android project built with its
+ * Gradle wrapper; React Native, Expo or Capacitor with their `android` folder; and an Expo
+ * project without one, which runs in Expo Go — the only way onto an iPhone from Windows.
+ */
+function mobileProject(checkout: string, fallbackName: string): Manifest | undefined {
+  const pubspec = readText(checkout, 'pubspec.yaml')
+  if (pubspec !== undefined && /^\s*flutter\s*:/m.test(pubspec)) {
+    return {
+      name: pubspec.match(/^name\s*:\s*([\w-]+)/m)?.[1] ?? fallbackName,
+      install: [{ run: 'flutter pub get' }],
+      build: [{ run: 'flutter build apk --debug' }],
+      start: { mode: 'android', apk: 'build/app/outputs/flutter-apk/app-debug.apk' },
+      source: 'detected'
+    }
+  }
+
+  const pkg = readPackage(checkout)
+  if (!pkg && hasGradle(checkout)) {
+    const settings = readText(checkout, 'settings.gradle.kts') ?? readText(checkout, 'settings.gradle') ?? ''
+    return {
+      name: settings.match(/rootProject\.name\s*=\s*["']([^"']+)["']/)?.[1] ?? fallbackName,
+      build: [{ run: 'gradlew assembleDebug' }],
+      start: { mode: 'android' },
+      source: 'detected'
+    }
+  }
+  if (!pkg) return undefined
+
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies }
+  if (!deps['@capacitor/android'] && !deps['react-native'] && !deps.expo) return undefined
+  npmOnly(checkout)
+  const android = join(checkout, 'android')
+  const name = pkg.name ?? fallbackName
+  const node = { runtime: { node: pkg.engines?.node }, cacheKeys: { node: ['package-lock.json'] } }
+  if (deps['@capacitor/android'] && hasGradle(android)) {
+    return {
+      name,
+      ...node,
+      install: [NPM_INSTALL],
+      build: [
+        ...(pkg.scripts?.build ? [{ run: 'npm run build' }] : []),
+        { run: 'npx cap sync android' },
+        { run: 'gradlew assembleDebug', cwd: 'android' }
+      ],
+      start: { mode: 'android', apk: 'android/app/build/outputs/apk/debug' },
+      source: 'detected'
+    }
+  }
+  if (deps['react-native'] && hasGradle(android)) {
+    // A release build carries its JavaScript; React Native's template signs it with the debug key.
+    return {
+      name,
+      ...node,
+      install: [NPM_INSTALL],
+      build: [{ run: 'gradlew assembleRelease', cwd: 'android' }],
+      start: { mode: 'android', apk: 'android/app/build/outputs/apk/release' },
+      source: 'detected'
+    }
+  }
+  if (deps.expo) {
+    return {
+      name,
+      ...node,
+      install: [NPM_INSTALL],
+      start: { mode: 'expo', run: 'npx expo start --port {port}', port: 8081 },
+      source: 'detected'
+    }
+  }
+  return undefined
 }
 
 /** Requirement files first, then pyproject.toml, which uv reads the same way. */

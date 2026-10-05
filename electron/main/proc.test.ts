@@ -157,6 +157,31 @@ describe('buildEnv', () => {
   })
 })
 
+describe('buildEnv — mobile', () => {
+  it("drops the tester's own JDK and SDK, and points the tools at TryMyDev's", () => {
+    const settings = { JAVA_HOME: 'C:\\Program Files\\Java\\jdk-8', ANDROID_HOME: 'C:\\Android', GRADLE_OPTS: '-Xmx64m', FLUTTER_ROOT: 'C:\\flutter' }
+    Object.assign(process.env, settings)
+    try {
+      const bare = buildEnv({ toolchain: { pathDirs: [] }, cwd: '.', log: undefined as never })
+      for (const name of Object.keys(settings)) assert.equal(bare[name], undefined, name)
+      const env = buildEnv({
+        toolchain: { pathDirs: [], java: { id: 'jdk-17', home: 'J', bin: 'J/bin/java' }, androidSdk: 'S', flutter: { id: 'flutter-3', root: 'F' } },
+        cwd: '.',
+        log: undefined as never
+      })
+      assert.equal(env.JAVA_HOME, 'J')
+      assert.equal(env.ANDROID_HOME, 'S')
+      assert.equal(env.ANDROID_SDK_ROOT, 'S')
+      assert.equal(env.GRADLE_USER_HOME, cacheDir('gradle'))
+      assert.equal(env.PUB_CACHE, cacheDir('pub'))
+      assert.equal(env.FLUTTER_ROOT, 'F')
+      assert.equal(env.FLUTTER_SUPPRESS_ANALYTICS, 'true')
+    } finally {
+      for (const name of Object.keys(settings)) delete process.env[name]
+    }
+  })
+})
+
 describe('what reaches an application', () => {
   let data: string
   let work: string
@@ -256,6 +281,17 @@ setInterval(() => {}, 1000)`
   })
 
   after(() => cleanup(work, data))
+
+  it("runs the project's own Gradle wrapper, written either way, and answers a tool that asks", async () => {
+    const wrapper = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew'
+    const body =
+      process.platform === 'win32'
+        ? '@echo off\r\nset /p answer=\r\necho wrapper %~1 %answer%\r\n'
+        : '#!/bin/sh\nread answer\necho wrapper $1 $answer\n'
+    writeFileSync(join(work, wrapper), body, { mode: 0o755 })
+    assert.equal((await capture('./gradlew assembleDebug', { ...ctx, input: 'yes\n' })).trim(), 'wrapper assembleDebug yes')
+    assert.equal((await capture('gradlew build', { ...ctx, input: 'y\n' })).trim(), 'wrapper build y')
+  })
 
   it('maps node onto the runtime of the toolchain, not the one on PATH', async () => {
     // Resolved on both sides: macOS reaches its temporary folder through /private.

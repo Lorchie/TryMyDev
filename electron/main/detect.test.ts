@@ -148,3 +148,68 @@ describe('detectManifest — anything else', () => {
     }
   })
 })
+
+describe('detectManifest — mobile', () => {
+  const gradle = { gradlew: '#!/bin/sh', 'settings.gradle': '' }
+
+  it('builds a Flutter project into a debug APK started on Android', () => {
+    const m = detectManifest(project({ 'pubspec.yaml': 'name: hello_app\nflutter:\n  uses-material-design: true\n' }), 'o/r')
+    assert.equal(m.name, 'hello_app')
+    assert.deepEqual(m.install, [{ run: 'flutter pub get' }])
+    assert.deepEqual(m.build, [{ run: 'flutter build apk --debug' }])
+    assert.deepEqual(m.start, { mode: 'android', apk: 'build/app/outputs/flutter-apk/app-debug.apk' })
+    validate(JSON.stringify(m), 'detected')
+  })
+
+  it('builds an Android project with its own Gradle wrapper', () => {
+    const m = detectManifest(
+      project({ gradlew: '', 'settings.gradle.kts': 'rootProject.name = "Notes"\ninclude(":app")' }),
+      'o/r'
+    )
+    assert.equal(m.name, 'Notes')
+    assert.deepEqual(m.build, [{ run: 'gradlew assembleDebug' }])
+    assert.deepEqual(m.start, { mode: 'android' })
+  })
+
+  it('builds React Native into a release APK, which carries its JavaScript', () => {
+    const m = detectManifest(
+      project({ ...lock, 'package.json': { name: 'rn', dependencies: { 'react-native': '0.80.0' } }, ...prefixed('android/', gradle) }),
+      'o/r'
+    )
+    assert.deepEqual(m.install, [{ run: 'npm install --dangerously-allow-all-scripts' }])
+    assert.deepEqual(m.build, [{ run: 'gradlew assembleRelease', cwd: 'android' }])
+    assert.deepEqual(m.start, { mode: 'android', apk: 'android/app/build/outputs/apk/release' })
+  })
+
+  it('syncs a Capacitor project into its Android shell before Gradle', () => {
+    const m = detectManifest(
+      project({
+        ...lock,
+        'package.json': { name: 'cap', scripts: { build: 'vite build' }, dependencies: { '@capacitor/android': '^7.0.0' } },
+        ...prefixed('android/', gradle)
+      }),
+      'o/r'
+    )
+    assert.deepEqual(
+      m.build?.map((s) => s.run),
+      ['npm run build', 'npx cap sync android', 'gradlew assembleDebug']
+    )
+  })
+
+  it('runs an Expo project without an android folder in Expo Go, on a free port', () => {
+    const m = detectManifest(project({ ...lock, 'package.json': { name: 'ex', dependencies: { expo: '^54.0.0', 'react-native': '0.81.0' } } }), 'o/r')
+    assert.deepEqual(m.start, { mode: 'expo', run: 'npx expo start --port {port}', port: 8081 })
+    validate(JSON.stringify(m), 'detected')
+  })
+
+  it('still refuses yarn for a mobile project', () => {
+    assert.throws(
+      () => detectManifest(project({ 'yarn.lock': '', 'package.json': { dependencies: { expo: '^54.0.0' } } }), 'o/r'),
+      /uses yarn/
+    )
+  })
+})
+
+function prefixed(prefix: string, files: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(files).map(([name, content]) => [`${prefix}${name}`, content]))
+}

@@ -10,21 +10,22 @@
   </head>
   <body>
     <button id="toggle" type="button" title="TryMyDev tools — drag to move" aria-label="TryMyDev tools" aria-expanded="false">
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-        <path
-          d="M14.7 6.3a4 4 0 0 0-5.4 5.1l-5 5a1.8 1.8 0 1 0 2.5 2.5l5-5a4 4 0 0 0 5.1-5.4l-2.4 2.4-2.2-.6-.6-2.2z"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.8"
-          stroke-linejoin="round"
-        />
+      <svg viewBox="0 0 100 100" width="24" height="24" aria-hidden="true">
+        <mask id="cut" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100">
+          <rect width="100" height="100" fill="#fff" />
+          <path d="M36 38 V62 M36 45 Q36 50 44 50 H50" fill="none" stroke="#000" stroke-width="5" stroke-linecap="round" />
+          <circle cx="36" cy="38" r="5" />
+          <circle cx="36" cy="62" r="5" />
+          <circle cx="53" cy="50" r="5.5" />
+        </mask>
+        <path mask="url(#cut)" d="M28 24 L74 50 L28 76 Z" fill="currentColor" stroke="currentColor" stroke-width="12" stroke-linejoin="round" />
       </svg>
     </button>
 
     <section id="menu" class="card" aria-label="TryMyDev tools">
       <header>
         <div>
-          <div class="product">TryMyDev</div>
+          <div class="product">You're testing</div>
           <div class="label" data-label></div>
         </div>
         <button class="close" type="button" title="Close" aria-label="Close" data-close>×</button>
@@ -35,8 +36,8 @@
     <section id="report" class="card" aria-label="Report a bug">
       <header>
         <div>
-          <div class="product">Report a bug</div>
-          <div class="label" data-label></div>
+          <h2>Report a bug</h2>
+          <div class="sub" data-label></div>
         </div>
         <button class="close" type="button" title="Cancel" aria-label="Cancel" data-close>×</button>
       </header>
@@ -50,6 +51,7 @@
           <span>Include a screenshot</span>
         </label>
         <img id="screenshot-preview" alt="Screenshot of the application" />
+        <div class="section">What will be saved</div>
         <details open>
           <summary>report.md</summary>
           <pre id="markdown"></pre>
@@ -73,17 +75,17 @@
     <section id="saved" class="card" aria-label="Report saved">
       <header>
         <div>
-          <div class="product">Report saved</div>
-          <div class="label" id="saved-name"></div>
+          <h2 class="ok">✓ Report saved</h2>
+          <div class="file" id="saved-name"></div>
         </div>
         <button class="close" type="button" title="Close" aria-label="Close" data-close>×</button>
       </header>
       <div class="body">
-        <p>Send this file to the developer.</p>
+        <p class="sub">Send this file to the branch's developer.</p>
       </div>
       <footer>
-        <button type="button" class="secondary" id="show">Show in folder</button>
-        <button type="button" class="primary" data-close>Done</button>
+        <button type="button" class="secondary" data-close>Done</button>
+        <button type="button" class="primary" id="show">Show in folder</button>
       </footer>
     </section>
 

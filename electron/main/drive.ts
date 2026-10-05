@@ -199,7 +199,22 @@ export function parseKey(combo: string): KeyInfo & { modifiers: number } {
 
 const SETTLE_MS = 400
 
-export class Driver {
+/** What an agent does with a running application, whatever it runs on. */
+export interface AppDriver {
+  close(): void
+  windows(): Promise<WindowInfo[]>
+  snapshot(windowId?: number): Promise<{ window: number; title: string; text: string }>
+  click(ref: string, windowId?: number, clicks?: number): Promise<number>
+  type(ref: string, value: string, submit: boolean, windowId?: number): Promise<number>
+  press(combo: string, windowId?: number): Promise<number>
+  scroll(direction: 'up' | 'down', ref: string | undefined, windowId?: number): Promise<number>
+  screenshot(windowId?: number): Promise<{ window: number; png: string }>
+  journal(): Promise<JournalSnapshot>
+  report(description: string, screenshot: boolean, windowId?: number): Promise<string>
+  waitFor(text: string | undefined, seconds: number, windowId?: number): Promise<boolean>
+}
+
+export class Driver implements AppDriver {
   /** References of the last snapshot, per window. */
   private readonly refs = new Map<number, Map<string, number>>()
 

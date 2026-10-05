@@ -39,6 +39,24 @@ export type StartSpec =
   | { mode: 'web'; run: string; port?: number; url?: string }
   /** Anything else: started and left running, no window of our own. */
   | { mode: 'command'; run: string }
+  /**
+   * An Android application: its APK installed on a phone plugged in with USB debugging, else
+   * on an emulator, then opened. A phone's screen is mirrored on the computer.
+   */
+  | {
+      mode: 'android'
+      /** The APK, or a folder searched for the newest one, relative to the checkout. */
+      apk?: string
+      /** The application id; read from the Gradle build when absent. */
+      package?: string
+      /** A GitHub Actions artifact holding the APK, taken instead of building when it exists for the commit. */
+      artifact?: string
+    }
+  /**
+   * An Expo project run in Expo Go, on Android or iPhone: its dev server is started and the
+   * phone opens it from a QR code — or a connected Android device opens it directly.
+   */
+  | { mode: 'expo'; run: string; port?: number }
 
 /** One of several starts: the first whose condition matches the machine is used. */
 export type ConditionalStart = StartSpec & { when?: Condition }
@@ -101,7 +119,7 @@ export interface Manifest {
   /** Default repository, `owner/repo`. Branches may come from any fork of it. */
   repo?: string
   /** Runtimes the project needs; downloaded once and shared by every app. */
-  runtime?: { node?: string; python?: string }
+  runtime?: { node?: string; python?: string; java?: string; flutter?: string }
   install?: Step[]
   build?: Step[]
   start: StartSpec | ConditionalStart[]
@@ -123,6 +141,8 @@ export interface Approved {
   hash: string
   /** `owner/repo`, lowercase: whose code the approval trusts with these commands. */
   source: string
+  /** The commands shown then, to point at what changed when the manifest does. */
+  commands?: string[]
 }
 
 export interface App {
@@ -140,14 +160,30 @@ export interface App {
   addedAt: string
 }
 
-export interface Source {
+/** A branch, fork or pull request on GitHub. */
+export interface GithubSource {
+  kind: 'github'
   owner: string
   repo: string
   ref: string
   pr?: number
 }
 
-export interface Branch extends Source {
+/** A branch of a clone on this computer: read with git, never pushed anywhere. */
+export interface LocalSource {
+  kind: 'local'
+  /** Absolute path of the working tree's top level. */
+  path: string
+  /**
+   * A branch's last commit. Without it, the folder as it is: whatever is checked out, with every
+   * change and every file .gitignore does not exclude.
+   */
+  ref?: string
+}
+
+export type Source = GithubSource | LocalSource
+
+export type Branch = Source & {
   key: string
   appId: string
   addedAt: string
@@ -155,6 +191,8 @@ export interface Branch extends Source {
 
 export interface BranchState {
   sha?: string
+  /** A local folder as it is: what it looked like when `sha` was read. */
+  fingerprint?: string
   builtSha?: string
   /** Hash of the manifest used for the last successful build. */
   manifestHash?: string
@@ -162,10 +200,16 @@ export interface BranchState {
   pythonKey?: string
   electronMajor?: string
   electronBinary?: string
-  /** Address to open for a `web` start, remembered between runs. */
+  /** Address to open for a `web` start, remembered between runs; `exp://…` for an `expo` one. */
   url?: string
+  /** The APK an `android` start installs, relative to the branch folder. */
+  apk?: string
+  /** The device an `android` start runs on, for the window. */
+  device?: string
   lastCheck?: string
   lastLaunch?: string
+  /** Milliseconds each phase took the last time sources were fetched or built, in `PHASES` order. */
+  durations?: number[]
   /** A detached application left running, found again after TryMyDev restarts. */
   running?: { pid: number; image: string; startedAt?: number }
 }
@@ -183,6 +227,9 @@ export type JobStep =
   | 'running'
   | 'done'
 
+/** What the tester sees of a start: each JobStep belongs to one of these. */
+export const PHASES = ['Download', 'Install', 'Build', 'Start'] as const
+
 export interface JobEvent {
   key: string
   step: JobStep
@@ -190,11 +237,20 @@ export interface JobEvent {
   percent?: number
   /** When the current step began, for the elapsed time shown on the card. */
   since?: number
+  /** Index in `PHASES`, and when that phase began. */
+  phase: number
+  phaseSince: number
+  /** When the start began. */
+  startedAt: number
+  /** How long each phase took last time, for an estimate of what is left. */
+  estimate?: number[]
 }
 
 export interface JobError {
   key: string
   step: JobStep
+  /** Index in `PHASES` of the step that failed. */
+  phase?: number
   message: string
   logTail: string
   logPath: string
@@ -206,8 +262,10 @@ export interface JobError {
 export interface Approval {
   appId: string
   appName: string
-  /** `owner/repo` the code comes from. */
+  /** `owner/repo` the code comes from, or the folder of a local clone. */
   repo: string
+  /** The code is a clone on this computer. */
+  local?: boolean
   /** `owner/repo` of the application, when known. */
   upstream?: string
   /** The code comes from another repository than the application's own. */
@@ -220,4 +278,24 @@ export interface Approval {
   downloads: string[]
   /** What the sources will lack, such as submodules GitHub archives leave out. */
   warnings: string[]
+  /** Commands absent from the last approval of this code, by index; only when there was one. */
+  changed?: number[]
+  /** For code from elsewhere than the official repository: what it changes in what runs at install. */
+  install?: InstallReview
+}
+
+/** One install file a branch changes, against the official project's default branch. */
+export interface InstallChange {
+  file: string
+  /** The official project has no such file. */
+  added: boolean
+  lines: string[]
+}
+
+export interface InstallReview {
+  /** `owner/repo` compared with, at its default branch. */
+  against: string
+  changes: InstallChange[]
+  /** Why the comparison could not be made. */
+  unavailable?: string
 }

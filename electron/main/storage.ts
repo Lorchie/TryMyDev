@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'fs'
 import { mkdir, readdir, rename, stat, statfs } from 'fs/promises'
 import { join } from 'path'
 import { appLog } from './applog'
-import { readJson, removePath, removeTree } from './fsx'
+import { readJson, removeTree } from './fsx'
 import { withLock } from './lock'
 import {
   CACHE_TOOLS,
@@ -20,6 +20,7 @@ import {
   venvStore
 } from './paths'
 import * as registry from './registry'
+import { refLabel } from './source-url'
 import type { BranchState } from './types'
 
 export interface UsageEntry {
@@ -28,6 +29,11 @@ export interface UsageEntry {
   bytes: number
   /** True when nothing references it any more and it can be removed safely. */
   orphan: boolean
+  /** Where it is shown: an application's name, Tools, Environments, Download caches or Leftovers. */
+  group: string
+  /** The application it belongs to, and the branch when it is one's folder. */
+  appId?: string
+  key?: string
 }
 
 export interface PruneOptions {
@@ -238,10 +244,13 @@ export async function usage(): Promise<UsageEntry[]> {
     const branchList = registry.branches(app.id)
     for (const branch of branchList) {
       entries.push({
-        label: `${app.name} · ${branch.ref}`,
+        label: `${app.name} · ${refLabel(branch)}`,
         path: branchDir(app.id, branch.key),
         bytes: await sizeOf(branchDir(app.id, branch.key)),
-        orphan: false
+        orphan: false,
+        group: app.name,
+        appId: app.id,
+        key: branch.key
       })
     }
     const shared = appSharedDir(app.id)
@@ -250,7 +259,9 @@ export async function usage(): Promise<UsageEntry[]> {
         label: `${app.name} · shared data`,
         path: shared,
         bytes: await sizeOf(shared),
-        orphan: branchList.length === 0
+        orphan: branchList.length === 0,
+        group: app.name,
+        appId: app.id
       })
     }
     const short = shortDir(app.id)
@@ -259,13 +270,21 @@ export async function usage(): Promise<UsageEntry[]> {
         label: `${app.name} · short-path folder`,
         path: short,
         bytes: await sizeOf(short),
-        orphan: branchList.length === 0
+        orphan: branchList.length === 0,
+        group: app.name,
+        appId: app.id
       })
     }
   }
 
   for (const leftover of await leftovers()) {
-    entries.push({ label: leftover.label, path: leftover.path, bytes: await sizeOf(leftover.path), orphan: true })
+    entries.push({
+      label: leftover.label,
+      path: leftover.path,
+      bytes: await sizeOf(leftover.path),
+      orphan: true,
+      group: 'Leftovers'
+    })
   }
 
   for (const store of STORES) {
@@ -276,7 +295,8 @@ export async function usage(): Promise<UsageEntry[]> {
         label: `${store.name} · ${key.slice(0, 8)}`,
         path: join(base, key),
         bytes: await sizeOf(join(base, key)),
-        orphan: referenced.unreadable.length === 0 && !referenced[store.kind].has(key)
+        orphan: referenced.unreadable.length === 0 && !referenced[store.kind].has(key),
+        group: 'Environments'
       })
     }
   }
@@ -285,12 +305,24 @@ export async function usage(): Promise<UsageEntry[]> {
   for (const tool of CACHE_TOOLS) {
     const dir = cacheDir(tool)
     if (existsSync(dir)) {
-      entries.push({ label: `Download cache · ${tool}`, path: dir, bytes: await sizeOf(dir), orphan: true })
+      entries.push({
+        label: `Download cache · ${tool}`,
+        path: dir,
+        bytes: await sizeOf(dir),
+        orphan: true,
+        group: 'Download caches'
+      })
     }
   }
 
   if (existsSync(trashDir())) {
-    entries.push({ label: 'Being cleaned up', path: trashDir(), bytes: await sizeOf(trashDir()), orphan: true })
+    entries.push({
+      label: 'Being cleaned up',
+      path: trashDir(),
+      bytes: await sizeOf(trashDir()),
+      orphan: true,
+      group: 'Leftovers'
+    })
   }
 
   const legacy = legacyPython()
@@ -299,11 +331,12 @@ export async function usage(): Promise<UsageEntry[]> {
       label: 'Runtime · Python (earlier version)',
       path: legacy.path,
       bytes: await sizeOf(legacy.path),
-      orphan: !legacy.used
+      orphan: !legacy.used,
+      group: 'Tools'
     })
   }
 
-  for (const kind of ['node', 'pythons', 'uv'] as const) {
+  for (const kind of ['node', 'pythons', 'uv', 'java', 'android', 'scrcpy', 'flutter', 'git'] as const) {
     const base = join(storeDir(), kind)
     if (!existsSync(base)) continue
     for (const entry of await readdir(base, { withFileTypes: true })) {
@@ -313,7 +346,8 @@ export async function usage(): Promise<UsageEntry[]> {
         label: `Runtime · ${entry.name}`,
         path: join(base, entry.name),
         bytes: await sizeOf(join(base, entry.name)),
-        orphan: false
+        orphan: false,
+        group: 'Tools'
       })
     }
   }
@@ -344,7 +378,7 @@ export function prune(options: PruneOptions = {}): Promise<number> {
           const referenced = referencedKeys()
           if (referenced.unreadable.length > 0 || referenced[store.kind].has(key)) return
           removed += await sizeOf(join(base, key))
-          await removePath(join(base, key))
+          await removeTree(join(base, key))
         })
       }
     }
@@ -364,7 +398,7 @@ export function prune(options: PruneOptions = {}): Promise<number> {
     const legacy = legacyPython()
     if (legacy && !legacy.used) {
       removed += await sizeOf(legacy.path)
-      await removePath(legacy.path)
+      await removeTree(legacy.path)
     }
 
     if (options.caches) {
@@ -372,7 +406,7 @@ export function prune(options: PruneOptions = {}): Promise<number> {
         const dir = cacheDir(tool)
         if (!existsSync(dir)) continue
         removed += await sizeOf(dir)
-        await removePath(dir)
+        await removeTree(dir)
       }
     }
     removed += await emptyTrash()

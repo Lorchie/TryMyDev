@@ -2,7 +2,7 @@ import { readJson, writeJson } from './fsx'
 import { download, request } from './network'
 import { etagsPath } from './paths'
 import { githubToken } from './settings'
-import { PRODUCT, type Source } from './types'
+import { PRODUCT, type GithubSource } from './types'
 import type { ParsedInput } from './source-url'
 
 const API = 'https://api.github.com'
@@ -14,9 +14,9 @@ interface EtagEntry {
 }
 
 /**
- * Anonymous GitHub allows 60 calls an hour — one branch check each would lock the
- * app out at a handful of branches. Conditional requests fix that: a 304 costs
- * nothing against the limit, so re-checking an unchanged branch is free.
+ * Conditional requests: an unchanged branch answers 304 with no body. Only an authorized 304
+ * is free — an anonymous one still counts against the 60 calls of an hour (measured
+ * 2026-09-11), so anonymous checks are never automatic.
  */
 function etags(): Record<string, EtagEntry> {
   return readJson<Record<string, EtagEntry>>(etagsPath(), {})
@@ -73,7 +73,7 @@ export async function rateLimit(token: string): Promise<number> {
 
 /** A branch or pull request, and the application it belongs to. */
 export interface Resolved {
-  source: Source
+  source: GithubSource
   /** `owner/repo` at the root of the fork network: what identifies the application. */
   upstream: string
 }
@@ -89,30 +89,45 @@ async function resolvePull(owner: string, repo: string, pr: number): Promise<Res
     throw new Error(`PR #${pr} exposes no source branch (fork deleted?).`)
   }
   return {
-    source: { owner: head.repo.owner.login, repo: head.repo.name, ref: head.ref, pr },
+    source: { kind: 'github', owner: head.repo.owner.login, repo: head.repo.name, ref: head.ref, pr },
     upstream: json.base?.repo?.full_name ?? `${owner}/${repo}`
   }
 }
 
+interface RepoJson {
+  full_name?: string
+  default_branch?: string
+  source?: { full_name?: string }
+}
+
+async function repository(owner: string, repo: string): Promise<RepoJson> {
+  return (await (await api(`/repos/${owner}/${repo}`)).json()) as RepoJson
+}
+
+function rootOf(json: RepoJson, owner: string, repo: string): string {
+  return json.source?.full_name ?? json.full_name ?? `${owner}/${repo}`
+}
+
+/** `owner/repo` at the root of the fork network a repository belongs to. */
+export async function upstreamOf(owner: string, repo: string): Promise<string> {
+  return rootOf(await repository(owner, repo), owner, repo)
+}
+
 /** One call: the repository gives both its default branch and the root of its forks. */
-export async function resolveSource(parsed: ParsedInput): Promise<Resolved> {
+export async function resolveSource(parsed: Extract<ParsedInput, { kind: 'github' }>): Promise<Resolved> {
   if (parsed.pr) return resolvePull(parsed.owner, parsed.repo, parsed.pr)
 
-  const json = (await (await api(`/repos/${parsed.owner}/${parsed.repo}`)).json()) as {
-    full_name?: string
-    default_branch?: string
-    source?: { full_name?: string }
-  }
+  const json = await repository(parsed.owner, parsed.repo)
   const ref = parsed.ref ?? json.default_branch
   if (!ref) throw new Error(`No default branch found for ${parsed.owner}/${parsed.repo}.`)
   return {
-    source: { owner: parsed.owner, repo: parsed.repo, ref },
-    upstream: json.source?.full_name ?? json.full_name ?? `${parsed.owner}/${parsed.repo}`
+    source: { kind: 'github', owner: parsed.owner, repo: parsed.repo, ref },
+    upstream: rootOf(json, parsed.owner, parsed.repo)
   }
 }
 
 /** Head commit of the ref. The whole cache hinges on this one value. */
-export async function headSha(src: Source): Promise<string> {
+export async function headSha(src: GithubSource): Promise<string> {
   const path = `/repos/${src.owner}/${src.repo}/commits/${encodeURIComponent(src.ref)}`
   const known = etags()[path]
 
@@ -134,8 +149,69 @@ export async function headSha(src: Source): Promise<string> {
   return sha
 }
 
+export interface Artifact {
+  repo: string
+  id: number
+  size: number
+  url: string
+}
+
+/**
+ * The newest artifact of that name a workflow built from this very commit — on the repository
+ * itself, or on the one a pull request targets, whose workflows run its checks. GitHub serves
+ * artifacts to signed-in users only: without a token there is none to find, and nothing is asked.
+ */
+export async function findArtifact(repos: string[], name: string, sha: string): Promise<Artifact | undefined> {
+  if (!githubToken()) return undefined
+  for (const repo of [...new Set(repos.map((r) => r.toLowerCase()))]) {
+    const res = await request(`${API}/repos/${repo}/actions/artifacts?name=${encodeURIComponent(name)}&per_page=50`, { headers: headers() })
+    if (!res.ok) continue
+    const json = (await res.json()) as {
+      artifacts?: Array<{ id: number; size_in_bytes: number; expired: boolean; archive_download_url: string; workflow_run?: { head_sha?: string } }>
+    }
+    const found = json.artifacts?.find((a) => !a.expired && a.workflow_run?.head_sha === sha)
+    if (found) return { repo, id: found.id, size: found.size_in_bytes, url: found.archive_download_url }
+  }
+  return undefined
+}
+
+/** An artifact is a zip; GitHub redirects to its storage, which the token does not follow to. */
+export async function downloadArtifact(
+  artifact: Artifact,
+  dest: string,
+  onProgress: (received: number, total: number) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  // The address comes from GitHub's answer: the token goes with it to GitHub's API only.
+  if (new URL(artifact.url).origin !== API) throw new Error(`Refused: an artifact address outside GitHub's API: ${artifact.url}`)
+  await download(artifact.url, dest, {
+    headers: headers(),
+    signal,
+    onProgress,
+    accept: (res) => {
+      if (!res.ok) throw new Error(`Could not download the artifact (HTTP ${res.status}).`)
+    }
+  })
+}
+
+const RAW = 'https://raw.githubusercontent.com'
+
+/**
+ * A file of a repository's default branch, or undefined when it has none. Served by GitHub's raw
+ * host, which does not count against the API's hourly limit.
+ */
+export async function rawFile(repo: string, path: string): Promise<string | undefined> {
+  const res = await request(`${RAW}/${repo}/HEAD/${path.split('/').map(encodeURIComponent).join('/')}`, {
+    headers: headers(),
+    answerMs: 15_000
+  })
+  if (res.status === 404) return undefined
+  if (!res.ok) throw new Error(`GitHub answered ${res.status} for ${path} of ${repo}`)
+  return res.text()
+}
+
 export async function downloadTarball(
-  src: Source,
+  src: GithubSource,
   sha: string,
   dest: string,
   onProgress: (received: number, total: number) => void,

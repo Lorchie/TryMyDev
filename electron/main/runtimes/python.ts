@@ -87,16 +87,25 @@ async function findPython(wanted: string, ctx: RunContext): Promise<PythonRuntim
   return { id: `cpython-${version}`, bin, dir: dirname(bin) }
 }
 
+export function uvLayout(): { id: string; dir: string; name: string } {
+  const id = `uv-${UV_VERSION}-${triple()}`
+  return { id, dir: runtimeDir('uv', id), name: process.platform === 'win32' ? 'uv.exe' : 'uv' }
+}
+
+/** uv as it is in the store, never downloaded: what a start from the cache has. */
+export async function cachedUv(): Promise<string | undefined> {
+  const { dir, name } = uvLayout()
+  return existsSync(dir) ? findBinary(dir, name) : undefined
+}
+
 /**
  * uv keeps one global wheel cache and hardlinks packages into each environment,
  * so a branch that changes a single dependency gets a complete, correct venv
  * without paying for it twice on disk — the reason we do not stack venvs.
  */
 export async function ensureUv(log: BranchLog): Promise<string> {
-  const id = `uv-${UV_VERSION}-${triple()}`
-  const dir = runtimeDir('uv', id)
-  const name = process.platform === 'win32' ? 'uv.exe' : 'uv'
-  const existing = existsSync(dir) ? await findBinary(dir, name) : undefined
+  const { id, dir, name } = uvLayout()
+  const existing = await cachedUv()
   if (existing) return existing
 
   return withLock(`runtime:${id}`, async () => {

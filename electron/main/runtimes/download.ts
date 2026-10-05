@@ -17,8 +17,11 @@ export interface FetchOptions {
   url: string
   /** Final directory. Filled atomically: either complete or absent. */
   dest: string
-  /** Expected sha256, or a URL serving it (a bare digest or "<digest>  <name>" lines). */
-  checksum: { url: string; file?: string } | { value: string }
+  /**
+   * Expected sha256, or a URL serving it (a bare digest or "<digest>  <name>" lines). Google's
+   * Android repository publishes sha1 only, from its own index over HTTPS: `algorithm` says so.
+   */
+  checksum: { url: string; file?: string } | { value: string; algorithm?: 'sha256' | 'sha1' }
   /** Leading path components to drop, like tar --strip-components. */
   strip?: number
   log: BranchLog
@@ -67,6 +70,7 @@ async function verify(
   log: BranchLog
 ): Promise<void> {
   let expected: string | undefined
+  const algorithm = ('algorithm' in checksum && checksum.algorithm) || 'sha256'
   if ('value' in checksum) {
     expected = checksum.value
   } else {
@@ -78,10 +82,10 @@ async function verify(
     expected = line.trim().split(/\s+/)[0]
   }
 
-  if (!expected || !/^[0-9a-f]{64}$/i.test(expected)) {
+  if (!expected || !(algorithm === 'sha1' ? /^[0-9a-f]{40}$/i : /^[0-9a-f]{64}$/i).test(expected)) {
     throw new Error(`Unreadable checksum for ${name} — the download was rejected.`)
   }
-  const actual = await fileDigest(archive)
+  const actual = await fileDigest(archive, algorithm)
   if (actual.toLowerCase() !== expected.toLowerCase()) {
     throw new Error(
       `Checksum mismatch for ${name}.\nexpected ${expected}\ngot      ${actual}\n` +
@@ -91,7 +95,7 @@ async function verify(
   log.line('[runtime] checksum verified')
 }
 
-async function extract(archive: string, dest: string, strip: number): Promise<void> {
+export async function extract(archive: string, dest: string, strip: number): Promise<void> {
   if (archive.endsWith('.zip')) {
     // bsdtar ships with Windows 10+ and with macOS; it reads zip archives, and it
     // is pinned by path because Git for Windows puts a GNU tar on PATH that

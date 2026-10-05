@@ -1,15 +1,14 @@
-import { app, BrowserWindow, dialog, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, session, shell } from 'electron'
 import { mkdirSync, statSync } from 'fs'
 import { join } from 'path'
 import { pathToFileURL } from 'url'
 import { syncAgent } from './agent'
 import { appLog, errorText } from './applog'
-import { resolveSource } from './github'
 import { registerIpc } from './ipc'
-import { reattach, refresh, startBranch } from './jobs'
+import { checkedFreely, reattach, refresh, startBranch } from './jobs'
 import * as registry from './registry'
 import { confine, restrictPermissions } from './security'
-import { parseInput } from './source-url'
+import { appFor, resolveInput } from './sources'
 import {
   appIcon,
   appLogPath,
@@ -20,13 +19,22 @@ import {
   rootDir,
   storeDir
 } from './paths'
-import { preferences } from './settings'
+import { preferences, theme } from './settings'
 import { prune, setIdleCachesAside } from './storage'
 import { PRODUCT } from './types'
 
 let mainWindow: BrowserWindow | null = null
 
-/** Branches are checked again this often; one that has not moved costs no request. */
+/** The window's own colours behind the page and under the system's title bar buttons, per theme. */
+const frameColors = (): { background: string; bar: string; symbols: string } =>
+  nativeTheme.shouldUseDarkColors
+    ? { background: '#111219', bar: '#15161e', symbols: '#eceef4' }
+    : { background: '#f6f7f9', bar: '#eef0f4', symbols: '#171922' }
+
+/**
+ * With a GitHub token, branches are checked again this often. Without one they are not:
+ * an anonymous 304 still counts, and 15 branches would use up the 60 calls of an hour.
+ */
 const UPDATE_CHECK_MS = 15 * 60_000
 
 app.setName(PRODUCT.name)
@@ -43,7 +51,12 @@ process.on('uncaughtException', (err) => {
 })
 process.on('unhandledRejection', (reason) => appLog(`[unhandled] ${errorText(reason)}`))
 
-function createWindow(): void {
+/** Once the IPC is registered, a window can be opened again. */
+let started = false
+
+function createWindow(argv: string[] = process.argv): void {
+  nativeTheme.themeSource = theme()
+  const colors = frameColors()
   mainWindow = new BrowserWindow({
     width: 1060,
     height: 760,
@@ -51,13 +64,13 @@ function createWindow(): void {
     minHeight: 560,
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: '#12131a',
+    backgroundColor: colors.background,
     icon: appIcon(),
     // The page draws the title bar (.titlebar), 40 px high; the system keeps its own buttons.
     titleBarStyle: 'hidden',
     ...(process.platform === 'darwin'
       ? { trafficLightPosition: { x: 14, y: 13 } }
-      : { titleBarOverlay: { color: '#14151d', symbolColor: '#e7e9f0', height: 40 } }),
+      : { titleBarOverlay: { color: colors.bar, symbolColor: colors.symbols, height: 40 } }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: true,
@@ -68,7 +81,7 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     mainWindow?.show()
-    void autoStart()
+    void autoStart(argv)
   })
   // A web application's window may keep TryMyDev alive after this one is gone.
   mainWindow.on('closed', () => {
@@ -81,7 +94,7 @@ function createWindow(): void {
 }
 
 /**
- * `trymydev --start=owner/repo@branch` adds the branch if needed and runs it,
+ * `trymydev --start=owner/repo@branch` (or `--start=C:\path\clone`, the folder as it is) adds the branch if needed and runs it,
  * so a tester can keep a desktop shortcut for the one branch they follow.
  * An unapproved manifest still stops for review.
  */
@@ -89,9 +102,8 @@ async function autoStart(argv: string[] = process.argv): Promise<void> {
   const arg = argv.find((a) => a.startsWith('--start='))?.slice('--start='.length)
   if (!arg || !mainWindow) return
   try {
-    const { source, upstream } = await resolveSource(parseInput(arg))
-    const entry = registry.addApp(upstream)
-    const branch = registry.addBranch(entry.id, source)
+    const resolved = await resolveInput(arg)
+    const branch = registry.addBranch(appFor(resolved).id, resolved.source)
     await startBranch(mainWindow, branch.key)
   } catch (err) {
     mainWindow.webContents.send('job:error', {
@@ -160,7 +172,11 @@ if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
-    if (!mainWindow) return
+    // Closed while a web application's window kept TryMyDev running: opened again, not ignored.
+    if (!mainWindow) {
+      if (started) createWindow(argv)
+      return
+    }
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
     void autoStart(argv)
@@ -185,14 +201,22 @@ if (!app.requestSingleInstanceLock()) {
 
     registerIpc(() => mainWindow, home)
     createWindow()
+    started = true
+    // "Match the system" follows it while TryMyDev runs; the page's colours follow by themselves.
+    nativeTheme.on('updated', () => {
+      if (!mainWindow) return
+      const colors = frameColors()
+      mainWindow.setBackgroundColor(colors.background)
+      if (process.platform !== 'darwin') mainWindow.setTitleBarOverlay({ color: colors.bar, symbolColor: colors.symbols })
+    })
     if (preferences().agent) void syncAgent(true, () => mainWindow)
 
     setInterval(() => {
-      if (mainWindow) void refresh(mainWindow, registry.branches())
+      if (mainWindow) void refresh(mainWindow, checkedFreely(registry.branches()))
     }, UPDATE_CHECK_MS).unref()
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      if (!mainWindow) createWindow()
     })
   }).catch((err) => {
     // A start that fails before the window exists would leave TryMyDev running unseen.

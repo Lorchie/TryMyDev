@@ -1,8 +1,8 @@
 import { copyFileSync, existsSync, readFileSync, renameSync } from 'fs'
 import { rename } from 'fs/promises'
-import { writeJson } from './fsx'
+import { hashString, writeJson } from './fsx'
 import { branchDir, registryBackupPath, registryPath } from './paths'
-import { branchKey } from './source-url'
+import { branchKey, codeSource, pathIdentity, sameSource, sourceLabel } from './source-url'
 import type { App, Branch, Manifest, Source } from './types'
 
 interface RegistryFile {
@@ -36,6 +36,8 @@ function read(): RegistryFile {
 function parse(text: string): RegistryFile {
   const file = JSON.parse(text) as Partial<RegistryFile>
   if (!Array.isArray(file.apps) || !Array.isArray(file.branches)) throw new Error('unexpected content')
+  // Branches recorded before local clones came all from GitHub.
+  for (const branch of file.branches as Array<{ kind?: string }>) branch.kind ??= 'github'
   return file as RegistryFile
 }
 
@@ -129,6 +131,21 @@ export function addApp(repo: string, manifest?: Manifest): App {
   return app
 }
 
+/** One application per clone with no GitHub remote, named after its folder. */
+export function addLocalApp(path: string, name: string, manifest?: Manifest): App {
+  const file = read()
+  const id = `${slug(name) || 'local'}-${hashString(`local:${pathIdentity(path)}`).slice(0, 6)}`
+  const existing = file.apps.find((a) => a.id === id)
+  if (existing) {
+    if (manifest) existing.manifest = manifest
+    write(file)
+    return existing
+  }
+  const app: App = { id, name: manifest?.name ?? name, manifest, addedAt: new Date().toISOString() }
+  write({ ...file, apps: [...file.apps, app] })
+  return app
+}
+
 /** The tester's folder for `id`, or back to the detected or default one without `path`. */
 export function setFolder(appId: string, id: string, path: string | undefined): void {
   const file = read()
@@ -140,11 +157,6 @@ export function setFolder(appId: string, id: string, path: string | undefined): 
   if (Object.keys(folders).length > 0) app.folders = folders
   else delete app.folders
   write(file)
-}
-
-/** `owner/repo` of the code a branch runs — what an approval trusts. */
-export function codeSource(src: Source): string {
-  return `${src.owner}/${src.repo}`.toLowerCase()
 }
 
 /**
@@ -159,21 +171,18 @@ export function isApproved(app: App, manifestHash: string, src: Source): boolean
   return (app.approvedHashes?.includes(manifestHash) ?? false) && source === app.repo?.toLowerCase()
 }
 
-export function approveApp(appId: string, manifestHash: string, src: Source): void {
+export function approveApp(appId: string, manifestHash: string, src: Source, commands?: string[]): void {
   const file = read()
   const app = file.apps.find((a) => a.id === appId)
   if (!app || isApproved(app, manifestHash, src)) return
-  app.approvals = [...(app.approvals ?? []), { hash: manifestHash, source: codeSource(src) }]
+  app.approvals = [...(app.approvals ?? []), { hash: manifestHash, source: codeSource(src), ...(commands ? { commands } : {}) }]
   write(file)
 }
 
-/** GitHub ignores the case of owners and repositories; refs are exact. */
-function sameSource(a: Source, b: Source): boolean {
-  return (
-    a.owner.toLowerCase() === b.owner.toLowerCase() &&
-    a.repo.toLowerCase() === b.repo.toLowerCase() &&
-    a.ref === b.ref
-  )
+/** The commands of the last approval given to this code, when they were recorded. */
+export function approvedCommands(app: App, src: Source): string[] | undefined {
+  const source = codeSource(src)
+  return app.approvals?.filter((a) => a.source === source && a.commands).at(-1)?.commands
 }
 
 /** A fork is the same application under another repository, not a new entry. */
@@ -183,7 +192,7 @@ export function addBranch(appId: string, src: Source): Branch {
   const existing = file.branches.find((b) => b.appId === appId && sameSource(b, src))
   if (existing) return existing
 
-  const branch: Branch = { ...src, key: branchKey(appId, src), appId, addedAt: new Date().toISOString() }
+  const branch = { ...src, key: branchKey(appId, src), appId, addedAt: new Date().toISOString() } as Branch
   write({ ...file, branches: [...file.branches, branch] })
   return branch
 }
@@ -227,6 +236,4 @@ export async function migrateKeys(
   return moved
 }
 
-export function label(branch: Branch): string {
-  return `${branch.owner}/${branch.repo} · ${branch.ref}${branch.pr ? ` (PR #${branch.pr})` : ''}`
-}
+export const label: (branch: Branch) => string = sourceLabel

@@ -4,11 +4,13 @@ import { existsSync } from 'fs'
 import { readlink } from 'fs/promises'
 import { basename, delimiter, extname, join, sep } from 'path'
 import { promisify } from 'util'
-import { cacheDir, pythonsDir } from './paths'
+import { androidAvdDir, androidUserDir, cacheDir, pythonsDir } from './paths'
 import { npmCliPath } from './runtimes/shim'
 import type { BranchLog } from './logger'
 import type { NodeRuntime } from './runtimes/node'
 import type { PythonRuntime } from './runtimes/python'
+import type { JavaRuntime } from './runtimes/java'
+import type { FlutterRuntime } from './runtimes/flutter'
 
 const execFileAsync = promisify(execFile)
 
@@ -24,6 +26,10 @@ export interface Toolchain {
   /** Interpreter of the branch's virtual environment, when it has one. */
   venvPython?: string
   uvBin?: string
+  java?: JavaRuntime
+  /** ANDROID_HOME, with its licence accepted. */
+  androidSdk?: string
+  flutter?: FlutterRuntime
   env?: Record<string, string>
   /** Proxy of the system, for tools that only read HTTPS_PROXY. */
   proxy?: string
@@ -35,6 +41,8 @@ export interface RunContext {
   log: BranchLog
   signal?: AbortSignal
   extraEnv?: Record<string, string>
+  /** Written to the command's input, then closed: answers to a tool that asks. */
+  input?: string
 }
 
 /** Splits a command line on spaces, honouring quotes. No shell, no expansion. */
@@ -107,6 +115,19 @@ const MACHINE_SETTINGS = new Set(
     'CONDA_PREFIX',
     'CONDA_DEFAULT_ENV',
     'PYENV_VERSION',
+    // The tester's own JDK, SDK and caches: a build here would depend on what they installed.
+    'JAVA_HOME',
+    'JDK_HOME',
+    'ANDROID_HOME',
+    'ANDROID_SDK_ROOT',
+    'ANDROID_USER_HOME',
+    'ANDROID_AVD_HOME',
+    'ANDROID_EMULATOR_HOME',
+    'GRADLE_USER_HOME',
+    'GRADLE_OPTS',
+    'JAVA_TOOL_OPTIONS',
+    'FLUTTER_ROOT',
+    'PUB_CACHE',
     // Inherited from our own process, it would turn a spawned Electron app into Node.
     'ELECTRON_RUN_AS_NODE',
     'ELECTRON_OVERRIDE_DIST_PATH',
@@ -157,11 +178,35 @@ function proxyEnv(proxy: string | undefined): Record<string, string> {
   }
 }
 
+/** Where the JDK, the Android SDK, Gradle and Flutter find what TryMyDev prepared. */
+function mobileEnv(toolchain: Toolchain): Record<string, string> {
+  const env: Record<string, string> = {}
+  if (toolchain.java) env.JAVA_HOME = toolchain.java.home
+  if (toolchain.java || toolchain.androidSdk || toolchain.flutter) {
+    env.GRADLE_USER_HOME = cacheDir('gradle')
+    env.PUB_CACHE = cacheDir('pub')
+  }
+  if (toolchain.androidSdk) {
+    env.ANDROID_HOME = toolchain.androidSdk
+    env.ANDROID_SDK_ROOT = toolchain.androidSdk
+    env.ANDROID_USER_HOME = androidUserDir()
+    env.ANDROID_AVD_HOME = androidAvdDir()
+  }
+  if (toolchain.flutter) {
+    env.FLUTTER_ROOT = toolchain.flutter.root
+    // Flutter asks once whether it may send usage data; nothing here can answer.
+    env.FLUTTER_SUPPRESS_ANALYTICS = 'true'
+    env.DART_SUPPRESS_ANALYTICS = 'true'
+  }
+  return env
+}
+
 export function buildEnv(ctx: RunContext): NodeJS.ProcessEnv {
   const { node } = ctx.toolchain
   return {
     ...inheritedEnv(),
     ...proxyEnv(ctx.toolchain.proxy),
+    ...mobileEnv(ctx.toolchain),
     // Downloads stay in the store: measured and cleaned up by Storage, and on the
     // volume of the environments uv hardlinks them into.
     UV_CACHE_DIR: cacheDir('uv'),
@@ -199,10 +244,19 @@ export function buildEnv(ctx: RunContext): NodeJS.ProcessEnv {
 function resolveCommand(
   command: string,
   args: string[],
-  toolchain: Toolchain
+  toolchain: Toolchain,
+  cwd?: string
 ): { file: string; args: string[] } {
-  const { node, python, venvPython, uvBin } = toolchain
-  const name = basename(command).toLowerCase().replace(/\.(exe|cmd)$/, '')
+  const { node, python, venvPython, uvBin, flutter } = toolchain
+  const name = basename(command).toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
+
+  // The project's own Gradle wrapper, written `gradlew` or `./gradlew` on every system.
+  if (name === 'gradlew' && cwd && /^(\.[\\/])?gradlew(\.bat)?$/i.test(command)) {
+    return { file: join(cwd, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew'), args }
+  }
+  if ((name === 'flutter' || name === 'dart') && flutter) {
+    return { file: join(flutter.root, 'bin', process.platform === 'win32' ? `${name}.bat` : name), args }
+  }
 
   if (name === 'node' && node) return { file: node.bin, args }
   if (name === 'npm' && node) return { file: node.bin, args: [npmCliPath(), ...args] }
@@ -242,7 +296,7 @@ function resolveOnPath(command: string, toolchain: Toolchain): string {
 export function run(line: string, ctx: RunContext): Promise<void> {
   const [command, ...rest] = splitCommand(line)
   if (!command) return Promise.resolve()
-  const { file, args } = resolveCommand(command, rest, ctx.toolchain)
+  const { file, args } = resolveCommand(command, rest, ctx.toolchain, ctx.cwd)
 
   return new Promise((resolve, reject) => {
     ctx.log.line(`$ ${line}`)
@@ -261,9 +315,17 @@ export function run(line: string, ctx: RunContext): Promise<void> {
  */
 export function startProcess(line: string, ctx: RunContext, output?: number): ChildProcess {
   const [command, ...rest] = splitCommand(line)
-  const { file, args } = resolveCommand(command ?? '', rest, ctx.toolchain)
+  const { file, args } = resolveCommand(command ?? '', rest, ctx.toolchain, ctx.cwd)
   ctx.log.line(`$ ${line}`)
   return start(file, args, ctx, output)
+}
+
+/**
+ * A tool TryMyDev runs itself — adb, sdkmanager — with its arguments as a list: what an agent
+ * types never goes through command splitting. Logged unless `logged` is false.
+ */
+export function spawnTool(file: string, args: string[], ctx: RunContext, logged = true): ChildProcess {
+  return start(file, args, ctx, undefined, logged)
 }
 
 function start(file: string, args: string[], ctx: RunContext, output?: number, logged = true): ChildProcess {
@@ -276,8 +338,12 @@ function start(file: string, args: string[], ctx: RunContext, output?: number, l
     // POSIX: a process group of its own, so killTree reaches its children. Windows:
     // only what must outlive TryMyDev leaves the job object that ends with it.
     detached: process.platform !== 'win32' || output !== undefined,
-    stdio: output === undefined ? ['ignore', 'pipe', 'pipe'] : ['ignore', output, output]
+    stdio: output === undefined ? [ctx.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] : ['ignore', output, output]
   })
+  if (ctx.input !== undefined && child.stdin) {
+    child.stdin.on('error', () => undefined)
+    child.stdin.end(ctx.input)
+  }
 
   if (logged) {
     child.stdout?.on('data', (d: Buffer) => ctx.log.write(d.toString()))
@@ -387,7 +453,7 @@ export async function processStartTime(pid: number): Promise<number | undefined>
  */
 export function capture(line: string, ctx: RunContext, options: { quiet?: boolean } = {}): Promise<string> {
   const [command, ...rest] = splitCommand(line)
-  const { file, args } = resolveCommand(command ?? '', rest, ctx.toolchain)
+  const { file, args } = resolveCommand(command ?? '', rest, ctx.toolchain, ctx.cwd)
 
   return new Promise((resolve, reject) => {
     const child = start(file, args, ctx, undefined, !options.quiet)
